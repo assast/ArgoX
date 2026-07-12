@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.7 (2026.06.04)'
+VERSION='2.0.8 (2026.07.13)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -43,8 +43,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="1. Replace Nekobox with Throne for client output; 2. Independent v2rayN configuration output; 3. Security upgrade: remove insecure=true, use TLS certificate fingerprint verification"
-C[1]="1. 使用 Throne 替代 Nekobox 进行客户端输出; 2. 独立生成 v2rayN 配置; 3. 安全升级：移除 insecure=true，启用 TLS 证书指纹校验"
+E[1]="Each selected protocol now generates 2 nodes: native exit IP + WARP exit IP"
+C[1]="每个协议同时生成 2 个节点：原生出口 IP + 套 WARP 出口 IP"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -434,12 +434,165 @@ statistics_of_run-times() {
 
 # 从 inbound.json 实时解析已安装协议列表，grep pattern 由 NODE_TAG 数组自动构建
 # 新增协议只需在顶部 NODE_TAG 数组里追加，此处无需手动维护
+# 每个协议有普通 + -warp 两套 inbound，此处归一化后去重
 get_installed_protocols() {
   [ -s $WORK_DIR/inbound.json ] || return
-  local _TAG_PATTERN
+  local _TAG_PATTERN _JQ
   _TAG_PATTERN=$(IFS='|'; echo "${NODE_TAG[*]}")
-  $WORK_DIR/jq -r '.inbounds[].tag' $WORK_DIR/inbound.json 2>/dev/null \
-    | grep -oE "$_TAG_PATTERN"
+  _JQ=$WORK_DIR/jq
+  [ -x "$_JQ" ] || _JQ=$TEMP_DIR/jq
+  [ -x "$_JQ" ] || return
+  "$_JQ" -r '.inbounds[].tag | split(" ")[-1] | sub("-warp$";"")' $WORK_DIR/inbound.json 2>/dev/null \
+    | grep -E "^($_TAG_PATTERN)$" | awk '!seen[$0]++'
+}
+
+# 定位 jq 二进制（安装中可能还在 TEMP_DIR）
+_jq_bin() {
+  if [ -x "$WORK_DIR/jq" ]; then
+    echo "$WORK_DIR/jq"
+  elif [ -x "$TEMP_DIR/jq" ]; then
+    echo "$TEMP_DIR/jq"
+  else
+    return 1
+  fi
+}
+
+# 根据普通 inbound JSON 生成套 WARP 的变体：改 tag/port，WS/XHTTP path 与 gRPC serviceName 追加 -warp
+# 用法: make_warp_inbound <block_json> <base_tag> <warp_port>
+make_warp_inbound() {
+  local _block="$1" _base_tag="$2" _warp_port="$3" _jq
+  _jq=$(_jq_bin) || return 1
+  printf '%s' "$_block" | "$_jq" -c --arg tag "${NODE_NAME} ${_base_tag}-warp" --argjson port "$_warp_port" '
+    .tag = $tag
+    | .port = $port
+    | if (.streamSettings.wsSettings.path // null) != null then
+        .streamSettings.wsSettings.path = (.streamSettings.wsSettings.path + "-warp")
+      else . end
+    | if (.streamSettings.xhttpSettings.path // null) != null then
+        .streamSettings.xhttpSettings.path = (.streamSettings.xhttpSettings.path + "-warp")
+      else . end
+    | if (.streamSettings.grpcSettings.serviceName // null) != null then
+        .streamSettings.grpcSettings.serviceName = (.streamSettings.grpcSettings.serviceName + "-warp")
+      else . end
+  '
+}
+
+# 把普通 inbound 与 warp inbound 追加到 INBOUNDS_JSON（pretty 缩进）
+# 用法: append_inbound_pair <block_json> <base_tag> <warp_port>
+append_inbound_pair() {
+  local _block="$1" _base_tag="$2" _warp_port="$3" _warp_block _jq _pretty
+  _jq=$(_jq_bin) || return 1
+  _pretty=$(printf '%s' "$_block" | "$_jq" .) || return 1
+  _warp_block=$(make_warp_inbound "$_block" "$_base_tag" "$_warp_port") || return 1
+  _warp_block=$(printf '%s' "$_warp_block" | "$_jq" .) || return 1
+  if [ "$FIRST" = true ]; then
+    INBOUNDS_JSON+="$_pretty"
+    FIRST=false
+  else
+    INBOUNDS_JSON+=$',\n'
+    INBOUNDS_JSON+="$_pretty"
+  fi
+  INBOUNDS_JSON+=$',\n'
+  INBOUNDS_JSON+="$_warp_block"
+}
+
+# 根据当前 inbound.json 重写 outbound.json（WARP 链式 + inboundTag 分流）
+write_outbound_json() {
+  local _jq _out4 _out6 _rules
+  _jq=$(_jq_bin) || return 1
+  _out4="${CHAT_GPT_OUT_V4:-}"
+  _out6="${CHAT_GPT_OUT_V6:-}"
+  # 已安装场景：若未设置，沿用现有 outbound 的 OpenAI 路由；否则默认 direct
+  if [ -z "$_out4" ] || [ -z "$_out6" ]; then
+    if [ -s "$WORK_DIR/outbound.json" ]; then
+      [ -z "$_out4" ] && _out4=$("$_jq" -r '[.routing.rules[]? | select(.domain[]? == "api.openai.com") | .outboundTag] | .[0] // empty' "$WORK_DIR/outbound.json" 2>/dev/null)
+      [ -z "$_out6" ] && _out6=$("$_jq" -r '[.routing.rules[]? | select((.domain // []) | index("geosite:openai")) | .outboundTag] | .[0] // empty' "$WORK_DIR/outbound.json" 2>/dev/null)
+    fi
+  fi
+  _out4=${_out4:-direct}
+  _out6=${_out6:-direct}
+  _rules=$("$_jq" -c --arg out4 "$_out4" --arg out6 "$_out6" '
+    [
+      {type:"field", domain:["api.openai.com"], outboundTag:$out4},
+      {type:"field", domain:["geosite:openai"], outboundTag:$out6}
+    ]
+    + [.inbounds[]
+        | select((.tag | split(" ")[-1]) | endswith("-warp"))
+        | {type:"field", inboundTag:[.tag], outboundTag:"warp-IPv4"}]
+    + [.inbounds[]
+        | select((.tag | split(" ")[-1]) | endswith("-warp") | not)
+        | {type:"field", inboundTag:[.tag], outboundTag:"direct"}]
+  ' "$WORK_DIR/inbound.json" 2>/dev/null)
+  [ -z "$_rules" ] && _rules="[{\"type\":\"field\",\"domain\":[\"api.openai.com\"],\"outboundTag\":\"${_out4}\"},{\"type\":\"field\",\"domain\":[\"geosite:openai\"],\"outboundTag\":\"${_out6}\"}]"
+
+  cat > $WORK_DIR/outbound.json << EOF
+{
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "tag": "direct"
+        },
+        {
+            "protocol": "blackhole",
+            "settings": {
+
+            },
+            "tag": "block"
+        },
+        {
+            "protocol": "wireguard",
+            "tag": "wireguard",
+            "settings": {
+                "secretKey": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+                "address": [
+                    "172.16.0.2/32",
+                    "2606:4700:110:8a36:df92:102a:9602:fa18/128"
+                ],
+                "peers": [
+                    {
+                        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                        "allowedIPs": [
+                            "0.0.0.0/0",
+                            "::/0"
+                        ],
+                        "endpoint": "engage.cloudflareclient.com:2408"
+                    }
+                ],
+                "reserved": [
+                    78,
+                    135,
+                    76
+                ],
+                "mtu": 1280
+            }
+        },
+        {
+            "protocol": "freedom",
+            "tag": "warp-IPv4",
+            "settings": {
+                "domainStrategy": "UseIPv4"
+            },
+            "proxySettings": {
+                "tag": "wireguard"
+            }
+        },
+        {
+            "protocol": "freedom",
+            "tag": "warp-IPv6",
+            "settings": {
+                "domainStrategy": "UseIPv6"
+            },
+            "proxySettings": {
+                "tag": "wireguard"
+            }
+        }
+    ],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": ${_rules}
+    }
+}
+EOF
 }
 
 # 读取或更新 custom 文件中的 key=value（可用 . $CUSTOM_FILE 批量加载）
@@ -842,9 +995,11 @@ xray_variable() {
   fi
 
   local NUM=${#INSTALL_PROTOCOLS[@]}
+  # 每个协议生成普通 + WARP 两个入站，需要 2*NUM 个连续端口
+  local PORT_NEED=$(( NUM * 2 ))
   if ! grep -q 'noninteractive_install' <<< "$NONINTERACTIVE_INSTALL" && [ -z "$START_PORT" ]; then
     (( STEP_NUM++ )) || true
-    input_start_port "$NUM"
+    input_start_port "$PORT_NEED"
   fi
   START_PORT=${START_PORT:-"$START_PORT_DEFAULT"}
   grep -q 'noninteractive_install' <<< "$NONINTERACTIVE_INSTALL" && SERVER_IP=${SERVER_IP:-"$SERVER_IP_DEFAULT"}
@@ -853,17 +1008,17 @@ xray_variable() {
   for i in "${!INSTALL_PROTOCOLS[@]}"; do
     local p="${INSTALL_PROTOCOLS[$i]}"
     case "$p" in
-      b) REALITY_PORT=$(( START_PORT + i )) ;;
-      c) HY2_PORT=$(( START_PORT + i )) ;;
-      d) GRPC_PORT=$(( START_PORT + i )) ;;
-      e) VLESS_WS_PORT=$(( START_PORT + i )) ;;
-      f) VMESS_WS_PORT=$(( START_PORT + i )) ;;
-      g) TROJAN_WS_PORT=$(( START_PORT + i )) ;;
-      h) SS_WS_PORT=$(( START_PORT + i )) ;;
-      i) VLESS_XHTTP_PORT=$(( START_PORT + i )) ;;
-      j) XHTTP_PORT=$(( START_PORT + i )) ;;
-      k) TROJAN_PORT=$(( START_PORT + i )) ;;
-      l) SS2022_PORT=$(( START_PORT + i )) ;;
+      b) REALITY_PORT=$(( START_PORT + i )); REALITY_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      c) HY2_PORT=$(( START_PORT + i )); HY2_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      d) GRPC_PORT=$(( START_PORT + i )); GRPC_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      e) VLESS_WS_PORT=$(( START_PORT + i )); VLESS_WS_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      f) VMESS_WS_PORT=$(( START_PORT + i )); VMESS_WS_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      g) TROJAN_WS_PORT=$(( START_PORT + i )); TROJAN_WS_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      h) SS_WS_PORT=$(( START_PORT + i )); SS_WS_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      i) VLESS_XHTTP_PORT=$(( START_PORT + i )); VLESS_XHTTP_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      j) XHTTP_PORT=$(( START_PORT + i )); XHTTP_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      k) TROJAN_PORT=$(( START_PORT + i )); TROJAN_WARP_PORT=$(( START_PORT + NUM + i )) ;;
+      l) SS2022_PORT=$(( START_PORT + i )); SS2022_WARP_PORT=$(( START_PORT + NUM + i )) ;;
     esac
   done
 
@@ -1062,20 +1217,21 @@ fast_install_variables() {
   read -r -a INSTALL_PROTOCOLS <<< "${_all_protocol_letters% }"
 
   START_PORT=${START_PORT:-"$START_PORT_DEFAULT"}
+  local _FAST_NUM=${#INSTALL_PROTOCOLS[@]}
   for i in "${!INSTALL_PROTOCOLS[@]}"; do
     local p="${INSTALL_PROTOCOLS[$i]}"
     case "$p" in
-      b) REALITY_PORT=$(( START_PORT + i )) ;;
-      c) HY2_PORT=$(( START_PORT + i )) ;;
-      d) GRPC_PORT=$(( START_PORT + i )) ;;
-      e) VLESS_WS_PORT=$(( START_PORT + i )) ;;
-      f) VMESS_WS_PORT=$(( START_PORT + i )) ;;
-      g) TROJAN_WS_PORT=$(( START_PORT + i )) ;;
-      h) SS_WS_PORT=$(( START_PORT + i )) ;;
-      i) VLESS_XHTTP_PORT=$(( START_PORT + i )) ;;
-      j) XHTTP_PORT=$(( START_PORT + i )) ;;
-      k) TROJAN_PORT=$(( START_PORT + i )) ;;
-      l) SS2022_PORT=$(( START_PORT + i )) ;;
+      b) REALITY_PORT=$(( START_PORT + i )); REALITY_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      c) HY2_PORT=$(( START_PORT + i )); HY2_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      d) GRPC_PORT=$(( START_PORT + i )); GRPC_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      e) VLESS_WS_PORT=$(( START_PORT + i )); VLESS_WS_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      f) VMESS_WS_PORT=$(( START_PORT + i )); VMESS_WS_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      g) TROJAN_WS_PORT=$(( START_PORT + i )); TROJAN_WS_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      h) SS_WS_PORT=$(( START_PORT + i )); SS_WS_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      i) VLESS_XHTTP_PORT=$(( START_PORT + i )); VLESS_XHTTP_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      j) XHTTP_PORT=$(( START_PORT + i )); XHTTP_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      k) TROJAN_PORT=$(( START_PORT + i )); TROJAN_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
+      l) SS2022_PORT=$(( START_PORT + i )); SS2022_WARP_PORT=$(( START_PORT + _FAST_NUM + i )) ;;
     esac
   done
 
@@ -1264,7 +1420,7 @@ parse_preferred_addr() {
 
 # 从已安装的 inbound.json / protocols 等配置文件中读取各参数，供 export_list / change_protocols 复用
 fetch_nodes_value() {
-  unset SERVER_IP REALITY_PORT REALITY_PUBLIC REALITY_PRIVATE TLS_SERVER SERVER SERVER_PORT SERVER_DISPLAY UUID WS_PATH NODE_NAME SS_WS_METHOD SS_DIRECT_METHOD SS2022_PASSWORD GRPC_PORT HY2_PORT VLESS_WS_PORT VMESS_WS_PORT TROJAN_WS_PORT SS_WS_PORT VLESS_XHTTP_PORT XHTTP_PORT TROJAN_PORT SS2022_PORT SERVER_IP_1 SERVER_IP_2 HY2_UP_NOW HY2_DOWN_NOW
+  unset SERVER_IP REALITY_PORT REALITY_WARP_PORT REALITY_PUBLIC REALITY_PRIVATE TLS_SERVER SERVER SERVER_PORT SERVER_DISPLAY UUID WS_PATH NODE_NAME SS_WS_METHOD SS_DIRECT_METHOD SS2022_PASSWORD GRPC_PORT GRPC_WARP_PORT HY2_PORT HY2_WARP_PORT VLESS_WS_PORT VLESS_WS_WARP_PORT VMESS_WS_PORT VMESS_WS_WARP_PORT TROJAN_WS_PORT TROJAN_WS_WARP_PORT SS_WS_PORT SS_WS_WARP_PORT VLESS_XHTTP_PORT VLESS_XHTTP_WARP_PORT XHTTP_PORT XHTTP_WARP_PORT TROJAN_PORT TROJAN_WARP_PORT SS2022_PORT SS2022_WARP_PORT SERVER_IP_1 SERVER_IP_2 HY2_UP_NOW HY2_DOWN_NOW
 
   [ -s "$CUSTOM_FILE" ] && . "$CUSTOM_FILE"
   SERVER_IP="${serverIp:-}"
@@ -1279,29 +1435,40 @@ fetch_nodes_value() {
   [ -z "$JSON" ] && [ ! -s "$CUSTOM_FILE" ] && return 1
   [ -z "$JSON" ] && return 0
 
-  REALITY_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[0].port // empty')
+  REALITY_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "reality-vision") | .port] | .[0] // empty' 2>/dev/null)
+  REALITY_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "reality-vision-warp") | .port] | .[0] // empty' 2>/dev/null)
   TLS_SERVER=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.streamSettings.security=="reality") | .streamSettings.realitySettings.serverNames[0]' 2>/dev/null | head -1)
   UUID=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[0].settings.clients[0].id // .inbounds[0].settings.clients[0].password // .inbounds[0].settings.clients[0].auth // empty')
-  WS_PATH=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.streamSettings.network=="ws") | .streamSettings.wsSettings.path' 2>/dev/null | head -1 | sed 's|/||; s|-vl$||; s|-vm$||; s|-tr$||; s|-sh$||; s|-xh$||')
-  NODE_NAME=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[0].tag // empty' | sed 's/ [^ ]*$//')
-  SS_WS_METHOD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.tag | split(" ")[-1] == "ss-ws") | .settings.clients[0].method // empty' 2>/dev/null | head -1)
-  SS2022_PASSWORD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.tag | split(" ")[-1] == "ss2022-direct") | .settings.password // empty' 2>/dev/null | head -1)
-  [ -z "$SS2022_PASSWORD" ] && SS2022_PASSWORD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.tag | split(" ")[-1] == "ss2022-direct") | .settings.clients[0].password // empty' 2>/dev/null | head -1)
-  SS_DIRECT_METHOD=$(echo "$JSON" | $WORK_DIR/jq -r --arg tag "${NODE_TAG[10]}" '.inbounds[] | select(.tag | endswith($tag)) | .settings.method | select(. != null)')
-  GRPC_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.streamSettings.network=="grpc") | .port] | .[0] // empty' 2>/dev/null)
+  WS_PATH=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select(.streamSettings.network=="ws") | .streamSettings.wsSettings.path' 2>/dev/null | head -1 | sed 's|/||; s|-vl$||; s|-vm$||; s|-tr$||; s|-sh$||; s|-xh$||; s|-warp$||')
+  NODE_NAME=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[0].tag // empty' | sed -E 's/ (reality-vision|hysteria2|reality-grpc|vless-ws|vmess-ws|trojan-ws|ss-ws|xhttp-h1\.1-cdn|xhttp-h3-direct|trojan-direct|ss2022-direct)(-warp)?$//')
+  SS_WS_METHOD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select((.tag | split(" ")[-1]) | test("^ss-ws(-warp)?$")) | .settings.clients[0].method // empty' 2>/dev/null | head -1)
+  SS2022_PASSWORD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select((.tag | split(" ")[-1]) | test("^ss2022-direct(-warp)?$")) | .settings.password // empty' 2>/dev/null | head -1)
+  [ -z "$SS2022_PASSWORD" ] && SS2022_PASSWORD=$(echo "$JSON" | $WORK_DIR/jq -r '.inbounds[] | select((.tag | split(" ")[-1]) | test("^ss2022-direct(-warp)?$")) | .settings.clients[0].password // empty' 2>/dev/null | head -1)
+  SS_DIRECT_METHOD=$(echo "$JSON" | $WORK_DIR/jq -r --arg tag "${NODE_TAG[10]}" '.inbounds[] | select((.tag | split(" ")[-1]) | test("^" + $tag + "(-warp)?$")) | .settings.method | select(. != null)' | head -1)
+  GRPC_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "reality-grpc") | .port] | .[0] // empty' 2>/dev/null)
+  GRPC_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "reality-grpc-warp") | .port] | .[0] // empty' 2>/dev/null)
   HY2_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "hysteria2") | .port] | .[0] // empty' 2>/dev/null)
+  HY2_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "hysteria2-warp") | .port] | .[0] // empty' 2>/dev/null)
   VLESS_WS_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vless-ws") | .port] | .[0] // empty' 2>/dev/null)
+  VLESS_WS_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vless-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
   VMESS_WS_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vmess-ws") | .port] | .[0] // empty' 2>/dev/null)
+  VMESS_WS_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vmess-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
   TROJAN_WS_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-ws") | .port] | .[0] // empty' 2>/dev/null)
+  TROJAN_WS_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
   SS_WS_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss-ws") | .port] | .[0] // empty' 2>/dev/null)
+  SS_WS_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
   VLESS_XHTTP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h1.1-cdn") | .port] | .[0] // empty' 2>/dev/null)
+  VLESS_XHTTP_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h1.1-cdn-warp") | .port] | .[0] // empty' 2>/dev/null)
   XHTTP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h3-direct") | .port] | .[0] // empty' 2>/dev/null)
+  XHTTP_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h3-direct-warp") | .port] | .[0] // empty' 2>/dev/null)
   [ -z "$TLS_SERVER" ] && TLS_SERVER=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.streamSettings.network=="hysteria") | .streamSettings.tlsSettings.serverNames[0]] | .[0] // empty' 2>/dev/null)
-  [ -z "$TLS_SERVER" ] && TLS_SERVER=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-direct") | .streamSettings.tlsSettings.serverName // .streamSettings.tlsSettings.serverNames[0]] | .[0] // empty' 2>/dev/null)
+  [ -z "$TLS_SERVER" ] && TLS_SERVER=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select((.tag | split(" ")[-1]) | test("^trojan-direct(-warp)?$")) | .streamSettings.tlsSettings.serverName // .streamSettings.tlsSettings.serverNames[0]] | .[0] // empty' 2>/dev/null)
   [ -z "$TLS_SERVER" ] && [ -s "$WORK_DIR/cert/cert.pem" ] && TLS_SERVER=$(openssl x509 -noout -ext subjectAltName -in "$WORK_DIR/cert/cert.pem" 2>/dev/null | awk -F 'DNS:' '/DNS:/{gsub(/,.*/,"",$2);print $2; exit}')
   [ -z "$SS2022_PASSWORD" ] && SS2022_PASSWORD="$(openssl rand -base64 16)"
   TROJAN_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-direct") | .port] | .[0] // empty' 2>/dev/null)
+  TROJAN_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-direct-warp") | .port] | .[0] // empty' 2>/dev/null)
   SS2022_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss2022-direct") | .port] | .[0] // empty' 2>/dev/null)
+  SS2022_WARP_PORT=$(echo "$JSON" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss2022-direct-warp") | .port] | .[0] // empty' 2>/dev/null)
 
   [ -z "$WS_PATH" ] && WS_PATH="$WS_PATH_DEFAULT"
   [ -z "$NODE_NAME" ] && NODE_NAME="ArgoX"
@@ -1720,6 +1887,7 @@ sync_service_firewall_rules() {
     while IFS=$'	' read -r TAG PORT; do
       [ -z "$TAG" ] || [ -z "$PORT" ] && continue
       TAG=${TAG##* }
+      TAG=${TAG%-warp}
       case "$TAG" in
         hysteria2) append_unique_port EXPOSED_UDP_PORTS "$PORT" ;;
         vless-ws|vmess-ws|trojan-ws|ss-ws|xhttp-h1.1-cdn) [ "$HAS_NGINX" = false ] && append_unique_port EXPOSED_TCP_PORTS "$PORT" ;;
@@ -2034,26 +2202,52 @@ json_nginx() {
   local SERVER_BLOCK=''
 
   local _PORT_VL _PORT_VM _PORT_TR _PORT_SH _PORT_XH
+  local _PORT_VL_W _PORT_VM_W _PORT_TR_W _PORT_SH_W _PORT_XH_W
   if [ -s $WORK_DIR/inbound.json ] && [ -x $WORK_DIR/jq ]; then
     local JSON_CLEAN=$(grep -v '^//' $WORK_DIR/inbound.json)
     _PORT_VL=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vless-ws") | .port] | .[0] // empty' 2>/dev/null)
+    _PORT_VL_W=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vless-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
     _PORT_VM=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vmess-ws") | .port] | .[0] // empty' 2>/dev/null)
+    _PORT_VM_W=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "vmess-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
     _PORT_TR=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-ws") | .port] | .[0] // empty' 2>/dev/null)
+    _PORT_TR_W=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "trojan-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
     _PORT_SH=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss-ws") | .port] | .[0] // empty' 2>/dev/null)
+    _PORT_SH_W=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "ss-ws-warp") | .port] | .[0] // empty' 2>/dev/null)
     _PORT_XH=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h1.1-cdn") | .port] | .[0] // empty' 2>/dev/null)
+    _PORT_XH_W=$(echo "$JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[] | select(.tag | split(" ")[-1] == "xhttp-h1.1-cdn-warp") | .port] | .[0] // empty' 2>/dev/null)
   fi
   _PORT_VL=${_PORT_VL:-${VLESS_WS_PORT}}
+  _PORT_VL_W=${_PORT_VL_W:-${VLESS_WS_WARP_PORT}}
   _PORT_VM=${_PORT_VM:-${VMESS_WS_PORT}}
+  _PORT_VM_W=${_PORT_VM_W:-${VMESS_WS_WARP_PORT}}
   _PORT_TR=${_PORT_TR:-${TROJAN_WS_PORT}}
+  _PORT_TR_W=${_PORT_TR_W:-${TROJAN_WS_WARP_PORT}}
   _PORT_SH=${_PORT_SH:-${SS_WS_PORT}}
+  _PORT_SH_W=${_PORT_SH_W:-${SS_WS_WARP_PORT}}
   _PORT_XH=${_PORT_XH:-${VLESS_XHTTP_PORT}}
+  _PORT_XH_W=${_PORT_XH_W:-${VLESS_XHTTP_WARP_PORT}}
 
   _add_location() { SERVER_BLOCK+="$1"; SERVER_BLOCK+=$'\n\n'; }
-  grep -q 'vless-ws' <<< "$PROTOCOLS_NOW" && _add_location "$(_ws_location "/${WS_PATH}-vl" "$_PORT_VL")"
-  grep -q 'vmess-ws' <<< "$PROTOCOLS_NOW" && _add_location "$(_ws_location "/${WS_PATH}-vm" "$_PORT_VM")"
-  grep -q 'trojan-ws' <<< "$PROTOCOLS_NOW" && _add_location "$(_ws_location "/${WS_PATH}-tr" "$_PORT_TR")"
-  grep -qw 'ss-ws' <<< "$PROTOCOLS_NOW" && _add_location "$(_ws_location "/${WS_PATH}-sh" "$_PORT_SH")"
-  grep -q 'xhttp-h1.1-cdn' <<< "$PROTOCOLS_NOW" && _add_location "$(_xhttp_location "/${WS_PATH}-xh" "${_PORT_XH}")"
+  grep -q 'vless-ws' <<< "$PROTOCOLS_NOW" && {
+    _add_location "$(_ws_location "/${WS_PATH}-vl" "$_PORT_VL")"
+    [ -n "$_PORT_VL_W" ] && _add_location "$(_ws_location "/${WS_PATH}-vl-warp" "$_PORT_VL_W")"
+  }
+  grep -q 'vmess-ws' <<< "$PROTOCOLS_NOW" && {
+    _add_location "$(_ws_location "/${WS_PATH}-vm" "$_PORT_VM")"
+    [ -n "$_PORT_VM_W" ] && _add_location "$(_ws_location "/${WS_PATH}-vm-warp" "$_PORT_VM_W")"
+  }
+  grep -q 'trojan-ws' <<< "$PROTOCOLS_NOW" && {
+    _add_location "$(_ws_location "/${WS_PATH}-tr" "$_PORT_TR")"
+    [ -n "$_PORT_TR_W" ] && _add_location "$(_ws_location "/${WS_PATH}-tr-warp" "$_PORT_TR_W")"
+  }
+  grep -qw 'ss-ws' <<< "$PROTOCOLS_NOW" && {
+    _add_location "$(_ws_location "/${WS_PATH}-sh" "$_PORT_SH")"
+    [ -n "$_PORT_SH_W" ] && _add_location "$(_ws_location "/${WS_PATH}-sh-warp" "$_PORT_SH_W")"
+  }
+  grep -q 'xhttp-h1.1-cdn' <<< "$PROTOCOLS_NOW" && {
+    _add_location "$(_xhttp_location "/${WS_PATH}-xh" "${_PORT_XH}")"
+    [ -n "$_PORT_XH_W" ] && _add_location "$(_xhttp_location "/${WS_PATH}-xh-warp" "${_PORT_XH_W}")"
+  }
   local SUB_BLOCK
   SUB_BLOCK=$(printf '    location ~ ^/%s/auto {
       default_type  text/plain;
@@ -2925,9 +3119,26 @@ JSONEOF
         ;;
     esac
     if [ -n "$BLOCK" ]; then
-      $FIRST || INBOUNDS_JSON+=$',\n'
-      INBOUNDS_JSON+="$BLOCK"
-      FIRST=false
+      local _BASE_TAG='' _WARP_PORT=''
+      case "$proto" in
+        b) _BASE_TAG="${NODE_TAG[0]}"; _WARP_PORT="$REALITY_WARP_PORT" ;;
+        c) _BASE_TAG="${NODE_TAG[1]}"; _WARP_PORT="$HY2_WARP_PORT" ;;
+        d) _BASE_TAG="${NODE_TAG[2]}"; _WARP_PORT="$GRPC_WARP_PORT" ;;
+        e) _BASE_TAG="${NODE_TAG[3]}"; _WARP_PORT="$VLESS_WS_WARP_PORT" ;;
+        f) _BASE_TAG="${NODE_TAG[4]}"; _WARP_PORT="$VMESS_WS_WARP_PORT" ;;
+        g) _BASE_TAG="${NODE_TAG[5]}"; _WARP_PORT="$TROJAN_WS_WARP_PORT" ;;
+        h) _BASE_TAG="${NODE_TAG[6]}"; _WARP_PORT="$SS_WS_WARP_PORT" ;;
+        i) _BASE_TAG="${NODE_TAG[7]}"; _WARP_PORT="$VLESS_XHTTP_WARP_PORT" ;;
+        j) _BASE_TAG="${NODE_TAG[8]}"; _WARP_PORT="$XHTTP_WARP_PORT" ;;
+        k) _BASE_TAG="${NODE_TAG[9]}"; _WARP_PORT="$TROJAN_WARP_PORT" ;;
+        l) _BASE_TAG="${NODE_TAG[10]}"; _WARP_PORT="$SS2022_WARP_PORT" ;;
+      esac
+      append_inbound_pair "$BLOCK" "$_BASE_TAG" "$_WARP_PORT" || {
+        # jq 不可用时回退：仅写入普通 inbound
+        $FIRST || INBOUNDS_JSON+=$',\n'
+        INBOUNDS_JSON+="$BLOCK"
+        FIRST=false
+      }
     fi
   done
 
@@ -2949,89 +3160,7 @@ ${INBOUNDS_JSON}
 }
 EOF
 
-  cat > $WORK_DIR/outbound.json << EOF
-{
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "settings": {
-
-            },
-            "tag": "block"
-        },
-        {
-            "protocol": "wireguard",
-            "tag": "wireguard",
-            "settings": {
-                "secretKey": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-                "address": [
-                    "172.16.0.2/32",
-                    "2606:4700:110:8a36:df92:102a:9602:fa18/128"
-                ],
-                "peers": [
-                    {
-                        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                        "allowedIPs": [
-                            "0.0.0.0/0",
-                            "::/0"
-                        ],
-                        "endpoint": "engage.cloudflareclient.com:2408"
-                    }
-                ],
-                "reserved": [
-                    78,
-                    135,
-                    76
-                ],
-                "mtu": 1280
-            }
-        },
-        {
-            "protocol": "freedom",
-            "tag": "warp-IPv4",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            },
-            "proxySettings": {
-                "tag": "wireguard"
-            }
-        },
-        {
-            "protocol": "freedom",
-            "tag": "warp-IPv6",
-            "settings": {
-                "domainStrategy": "UseIPv6"
-            },
-            "proxySettings": {
-                "tag": "wireguard"
-            }
-        }
-    ],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [
-            {
-                "type": "field",
-                "domain": [
-                    "api.openai.com"
-                ],
-                "outboundTag": "${CHAT_GPT_OUT_V4}"
-            },
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:openai"
-                ],
-                "outboundTag": "${CHAT_GPT_OUT_V6}"
-            }
-        ]
-    }
-}
-EOF
+  write_outbound_json
 
   [ "$INSTALL_NGINX" != 'n' ] && json_nginx
 
@@ -3142,7 +3271,7 @@ export_list() {
 
   # 统一生成所有客户端订阅
   local SERVER_PORT_NOW=${SERVER_PORT:-443}
-  local CLASH='proxies:' SHADOWROCKET_SUBSCRIBE='' V2RAYN_SUBSCRIBE='' SHADOWROCKET_DISPLAY='' V2RAYN_DISPLAY=''
+  local CLASH='proxies:' SHADOWROCKET_SUBSCRIBE='' V2RAYN_SUBSCRIBE='' THRONE_SUBSCRIBE='' SHADOWROCKET_DISPLAY='' V2RAYN_DISPLAY='' THRONE_DISPLAY=''
   local SINGBOX_OUTBOUNDS='' SINGBOX_TAGS='' SINGBOX_SEP=''
   _sb_add() { SINGBOX_OUTBOUNDS+="${SINGBOX_SEP}$1"; SINGBOX_TAGS+="${SINGBOX_SEP}$2"; SINGBOX_SEP=', '; }
   _add() {
@@ -3154,16 +3283,30 @@ export_list() {
     [ -n "$singbox" ] && _sb_add "$singbox" "\"$tag\""
   }
 
+  # 每个协议生成 2 个节点：原生出口 + 套 WARP 出口
   # reality-vision
-  grep -q 'reality-vision' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[0]}\", type: vless, server: ${SERVER_IP}, port: ${REALITY_PORT}, uuid: ${UUID}, network: tcp, udp: true, tls: true, servername: ${TLS_SERVER}, flow: xtls-rprx-vision, client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"} }" \
-    "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${REALITY_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${NODE_TAG[0]}&obfs=none&tls=1&peer=${TLS_SERVER}&xtls=2&pbk=${REALITY_PUBLIC}" \
-    "vless://${UUID}@${SERVER_IP_1}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=tcp&headerType=none#${NODE_NAME// /%20}%20${NODE_TAG[0]}" \
-    "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${NODE_TAG[0]}\", \"server\":\"${SERVER_IP}\", \"server_port\": ${REALITY_PORT}, \"uuid\":\"${UUID}\", \"flow\":\"xtls-rprx-vision\", \"packet_encoding\":\"xudp\", \"tls\":{ \"enabled\":true, \"server_name\":\"${TLS_SERVER}\", \"utls\":{ \"enabled\":true, \"fingerprint\":\"chrome\" }, \"reality\":{ \"enabled\":true, \"public_key\":\"${REALITY_PUBLIC}\", \"short_id\":\"\" } } }" \
-    "vless://${UUID}@${SERVER_IP_1}:${REALITY_PORT}?security=reality&sni=${TLS_SERVER}&fp=firefox&pbk=${REALITY_PUBLIC}&type=tcp&flow=xtls-rprx-vision&encryption=none#${NODE_NAME// /%20}%20${NODE_TAG[0]}" \
-    "${NODE_NAME} ${NODE_TAG[0]}"
+  if grep -q 'reality-vision' <<< "$PROTOS_NOW"; then
+    local _tag0="${NODE_TAG[0]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag0}\", type: vless, server: ${SERVER_IP}, port: ${REALITY_PORT}, uuid: ${UUID}, network: tcp, udp: true, tls: true, servername: ${TLS_SERVER}, flow: xtls-rprx-vision, client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"} }" \
+      "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${REALITY_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag0}&obfs=none&tls=1&peer=${TLS_SERVER}&xtls=2&pbk=${REALITY_PUBLIC}" \
+      "vless://${UUID}@${SERVER_IP_1}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=tcp&headerType=none#${NODE_NAME// /%20}%20${_tag0}" \
+      "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${_tag0}\", \"server\":\"${SERVER_IP}\", \"server_port\": ${REALITY_PORT}, \"uuid\":\"${UUID}\", \"flow\":\"xtls-rprx-vision\", \"packet_encoding\":\"xudp\", \"tls\":{ \"enabled\":true, \"server_name\":\"${TLS_SERVER}\", \"utls\":{ \"enabled\":true, \"fingerprint\":\"chrome\" }, \"reality\":{ \"enabled\":true, \"public_key\":\"${REALITY_PUBLIC}\", \"short_id\":\"\" } } }" \
+      "vless://${UUID}@${SERVER_IP_1}:${REALITY_PORT}?security=reality&sni=${TLS_SERVER}&fp=firefox&pbk=${REALITY_PUBLIC}&type=tcp&flow=xtls-rprx-vision&encryption=none#${NODE_NAME// /%20}%20${_tag0}" \
+      "${NODE_NAME} ${_tag0}"
+    if [ -n "$REALITY_WARP_PORT" ]; then
+      local _tag0w="${_tag0}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag0w}\", type: vless, server: ${SERVER_IP}, port: ${REALITY_WARP_PORT}, uuid: ${UUID}, network: tcp, udp: true, tls: true, servername: ${TLS_SERVER}, flow: xtls-rprx-vision, client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"} }" \
+        "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${REALITY_WARP_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag0w}&obfs=none&tls=1&peer=${TLS_SERVER}&xtls=2&pbk=${REALITY_PUBLIC}" \
+        "vless://${UUID}@${SERVER_IP_1}:${REALITY_WARP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=tcp&headerType=none#${NODE_NAME// /%20}%20${_tag0w}" \
+        "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${_tag0w}\", \"server\":\"${SERVER_IP}\", \"server_port\": ${REALITY_WARP_PORT}, \"uuid\":\"${UUID}\", \"flow\":\"xtls-rprx-vision\", \"packet_encoding\":\"xudp\", \"tls\":{ \"enabled\":true, \"server_name\":\"${TLS_SERVER}\", \"utls\":{ \"enabled\":true, \"fingerprint\":\"chrome\" }, \"reality\":{ \"enabled\":true, \"public_key\":\"${REALITY_PUBLIC}\", \"short_id\":\"\" } } }" \
+        "vless://${UUID}@${SERVER_IP_1}:${REALITY_WARP_PORT}?security=reality&sni=${TLS_SERVER}&fp=firefox&pbk=${REALITY_PUBLIC}&type=tcp&flow=xtls-rprx-vision&encryption=none#${NODE_NAME// /%20}%20${_tag0w}" \
+        "${NODE_NAME} ${_tag0w}"
+    fi
+  fi
 
-  # hysteria2
+  # hysteria2（端口跳跃仅挂在普通节点；WARP 节点走独立端口）
   if grep -q 'hysteria2' <<< "$PROTOS_NOW"; then
     local _chop='' _srhop='' _v2hop='' _sbhp='' _thop=''
     if [[ -n "$PORT_HOPPING_START" && -n "$PORT_HOPPING_END" ]]; then
@@ -3173,98 +3316,215 @@ export_list() {
       _chop="ports: ${PORT_HOPPING_START}-${PORT_HOPPING_END}, hop-interval: 30, "
       _thop="&mport=${PORT_HOPPING_START}-${PORT_HOPPING_END}&hop_interval=30s"
     fi
-    # 使用动态带宽参数，默认为 200/1000
     local _hy2_up="${HY2_UP_NOW:-200}"
     local _hy2_down="${HY2_DOWN_NOW:-1000}"
+    local _tag1="${NODE_TAG[1]}"
     _add \
-      "{name: \"${NODE_NAME} ${NODE_TAG[1]}\", type: hysteria2, server: ${SERVER_IP}, port: ${HY2_PORT}, ${_chop}up: \"${_hy2_up} Mbps\", down: \"${_hy2_down} Mbps\", password: ${UUID}, sni: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256}}" \
-      "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_PORT}?peer=${CERT_SNI}&hpkp=${FP_SHA256}&obfs=none&upmbps=${_hy2_up}&downmbps=${_hy2_down}${_srhop}#${NODE_NAME// /%20}%20${NODE_TAG[1]}" \
-      "v2rayn://hysteria2/$(echo -n "{\"ConfigType\":7,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${NODE_TAG[1]}\",\"Address\":\"${SERVER_IP}\",\"Port\":${HY2_PORT},\"Password\":\"${UUID}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${TLS_SERVER}\",\"Cert\":\"${CERT_URL_2}\",\"ProtoExtraObj\":{\"UpMbps\":${_hy2_up},\"DownMbps\":${_hy2_down}${_v2hop}}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
-      "{ \"type\": \"hysteria2\", \"tag\": \"${NODE_NAME} ${NODE_TAG[1]}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${HY2_PORT}${_sbhp}, \"up_mbps\": ${_hy2_up}, \"down_mbps\": ${_hy2_down}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"], \"alpn\": [ \"h3\" ] } }" \
-      "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_PORT}?allowInsecure=false&alpn&security=tls&sni=${TLS_SERVER}&upmbps=${_hy2_up}&downmbps=${_hy2_down}&security=tls&tls_certificate=${CERT_URL_1}${_thop}&fp=chrome#${NODE_NAME// /%20}%20${NODE_TAG[1]}" \
-      "${NODE_NAME} ${NODE_TAG[1]}"
+      "{name: \"${NODE_NAME} ${_tag1}\", type: hysteria2, server: ${SERVER_IP}, port: ${HY2_PORT}, ${_chop}up: \"${_hy2_up} Mbps\", down: \"${_hy2_down} Mbps\", password: ${UUID}, sni: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256}}" \
+      "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_PORT}?peer=${CERT_SNI}&hpkp=${FP_SHA256}&obfs=none&upmbps=${_hy2_up}&downmbps=${_hy2_down}${_srhop}#${NODE_NAME// /%20}%20${_tag1}" \
+      "v2rayn://hysteria2/$(echo -n "{\"ConfigType\":7,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag1}\",\"Address\":\"${SERVER_IP}\",\"Port\":${HY2_PORT},\"Password\":\"${UUID}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${TLS_SERVER}\",\"Cert\":\"${CERT_URL_2}\",\"ProtoExtraObj\":{\"UpMbps\":${_hy2_up},\"DownMbps\":${_hy2_down}${_v2hop}}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+      "{ \"type\": \"hysteria2\", \"tag\": \"${NODE_NAME} ${_tag1}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${HY2_PORT}${_sbhp}, \"up_mbps\": ${_hy2_up}, \"down_mbps\": ${_hy2_down}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"], \"alpn\": [ \"h3\" ] } }" \
+      "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_PORT}?allowInsecure=false&alpn&security=tls&sni=${TLS_SERVER}&upmbps=${_hy2_up}&downmbps=${_hy2_down}&security=tls&tls_certificate=${CERT_URL_1}${_thop}&fp=chrome#${NODE_NAME// /%20}%20${_tag1}" \
+      "${NODE_NAME} ${_tag1}"
+    if [ -n "$HY2_WARP_PORT" ]; then
+      local _tag1w="${_tag1}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag1w}\", type: hysteria2, server: ${SERVER_IP}, port: ${HY2_WARP_PORT}, up: \"${_hy2_up} Mbps\", down: \"${_hy2_down} Mbps\", password: ${UUID}, sni: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256}}" \
+        "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_WARP_PORT}?peer=${CERT_SNI}&hpkp=${FP_SHA256}&obfs=none&upmbps=${_hy2_up}&downmbps=${_hy2_down}#${NODE_NAME// /%20}%20${_tag1w}" \
+        "v2rayn://hysteria2/$(echo -n "{\"ConfigType\":7,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag1w}\",\"Address\":\"${SERVER_IP}\",\"Port\":${HY2_WARP_PORT},\"Password\":\"${UUID}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${TLS_SERVER}\",\"Cert\":\"${CERT_URL_2}\",\"ProtoExtraObj\":{\"UpMbps\":${_hy2_up},\"DownMbps\":${_hy2_down}}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+        "{ \"type\": \"hysteria2\", \"tag\": \"${NODE_NAME} ${_tag1w}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${HY2_WARP_PORT}, \"up_mbps\": ${_hy2_up}, \"down_mbps\": ${_hy2_down}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"], \"alpn\": [ \"h3\" ] } }" \
+        "hysteria2://${UUID}@${SERVER_IP_1}:${HY2_WARP_PORT}?allowInsecure=false&alpn&security=tls&sni=${TLS_SERVER}&upmbps=${_hy2_up}&downmbps=${_hy2_down}&security=tls&tls_certificate=${CERT_URL_1}&fp=chrome#${NODE_NAME// /%20}%20${_tag1w}" \
+        "${NODE_NAME} ${_tag1w}"
+    fi
   fi
 
   # reality-grpc
-  grep -q 'reality-grpc' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[2]}\", type: vless, server: ${SERVER_IP}, port: ${GRPC_PORT}, uuid: ${UUID}, network: grpc, udp: true, tls: true, servername: ${TLS_SERVER}, flow: , client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"}, grpc-opts: {grpc-service-name: \"grpc\"} }" \
-    "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${GRPC_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${NODE_TAG[2]}&path=grpc&obfs=grpc&tls=1&peer=${TLS_SERVER}&pbk=${REALITY_PUBLIC}" \
-    "vless://${UUID}@${SERVER_IP_1}:${GRPC_PORT}?security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=grpc&serviceName=grpc&encryption=none#${NODE_NAME// /%20}%20${NODE_TAG[2]}" \
-    "{ \"type\": \"vless\", \"tag\":\"${NODE_NAME} ${NODE_TAG[2]}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${GRPC_PORT}, \"uuid\": \"${UUID}\", \"packet_encoding\":\"xudp\", \"tls\": { \"enabled\": true, \"server_name\": \"${TLS_SERVER}\", \"utls\": { \"enabled\": true, \"fingerprint\": \"chrome\" }, \"reality\": { \"enabled\": true, \"public_key\": \"${REALITY_PUBLIC}\", \"short_id\": \"\" } }, \"transport\": { \"type\": \"grpc\", \"service_name\": \"grpc\" } }" \
-    "vless://${UUID}@${SERVER_IP_1}:${GRPC_PORT}?encryption=none&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&sid&type=grpc&serviceName=grpc&packetEncoding=xudp#${NODE_NAME// /%20}%20${NODE_TAG[2]}" \
-    "${NODE_NAME} ${NODE_TAG[2]}"
+  if grep -q 'reality-grpc' <<< "$PROTOS_NOW"; then
+    local _tag2="${NODE_TAG[2]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag2}\", type: vless, server: ${SERVER_IP}, port: ${GRPC_PORT}, uuid: ${UUID}, network: grpc, udp: true, tls: true, servername: ${TLS_SERVER}, flow: , client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"}, grpc-opts: {grpc-service-name: \"grpc\"} }" \
+      "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${GRPC_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag2}&path=grpc&obfs=grpc&tls=1&peer=${TLS_SERVER}&pbk=${REALITY_PUBLIC}" \
+      "vless://${UUID}@${SERVER_IP_1}:${GRPC_PORT}?security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=grpc&serviceName=grpc&encryption=none#${NODE_NAME// /%20}%20${_tag2}" \
+      "{ \"type\": \"vless\", \"tag\":\"${NODE_NAME} ${_tag2}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${GRPC_PORT}, \"uuid\": \"${UUID}\", \"packet_encoding\":\"xudp\", \"tls\": { \"enabled\": true, \"server_name\": \"${TLS_SERVER}\", \"utls\": { \"enabled\": true, \"fingerprint\": \"chrome\" }, \"reality\": { \"enabled\": true, \"public_key\": \"${REALITY_PUBLIC}\", \"short_id\": \"\" } }, \"transport\": { \"type\": \"grpc\", \"service_name\": \"grpc\" } }" \
+      "vless://${UUID}@${SERVER_IP_1}:${GRPC_PORT}?encryption=none&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&sid&type=grpc&serviceName=grpc&packetEncoding=xudp#${NODE_NAME// /%20}%20${_tag2}" \
+      "${NODE_NAME} ${_tag2}"
+    if [ -n "$GRPC_WARP_PORT" ]; then
+      local _tag2w="${_tag2}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag2w}\", type: vless, server: ${SERVER_IP}, port: ${GRPC_WARP_PORT}, uuid: ${UUID}, network: grpc, udp: true, tls: true, servername: ${TLS_SERVER}, flow: , client-fingerprint: chrome, reality-opts: {public-key: ${REALITY_PUBLIC}, short-id: \"\"}, grpc-opts: {grpc-service-name: \"grpc-warp\"} }" \
+        "vless://$(echo -n "auto:${UUID}@${SERVER_IP_2}:${GRPC_WARP_PORT}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag2w}&path=grpc-warp&obfs=grpc&tls=1&peer=${TLS_SERVER}&pbk=${REALITY_PUBLIC}" \
+        "vless://${UUID}@${SERVER_IP_1}:${GRPC_WARP_PORT}?security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&type=grpc&serviceName=grpc-warp&encryption=none#${NODE_NAME// /%20}%20${_tag2w}" \
+        "{ \"type\": \"vless\", \"tag\":\"${NODE_NAME} ${_tag2w}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${GRPC_WARP_PORT}, \"uuid\": \"${UUID}\", \"packet_encoding\":\"xudp\", \"tls\": { \"enabled\": true, \"server_name\": \"${TLS_SERVER}\", \"utls\": { \"enabled\": true, \"fingerprint\": \"chrome\" }, \"reality\": { \"enabled\": true, \"public_key\": \"${REALITY_PUBLIC}\", \"short_id\": \"\" } }, \"transport\": { \"type\": \"grpc\", \"service_name\": \"grpc-warp\" } }" \
+        "vless://${UUID}@${SERVER_IP_1}:${GRPC_WARP_PORT}?encryption=none&security=reality&sni=${TLS_SERVER}&fp=chrome&pbk=${REALITY_PUBLIC}&sid&type=grpc&serviceName=grpc-warp&packetEncoding=xudp#${NODE_NAME// /%20}%20${_tag2w}" \
+        "${NODE_NAME} ${_tag2w}"
+    fi
+  fi
 
   # vless-ws
-  grep -q 'vless-ws' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[3]}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vl\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"} }" \
-    "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl?ed=2560&sni=${ARGO_DOMAIN}#${NODE_NAME// /%20}%20${NODE_TAG[3]}" \
-    "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-vl%3Fed%3D2560#${NODE_NAME// /%20}%20${NODE_TAG[3]}" \
-    "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${NODE_TAG[3]}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vl\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
-    "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol&packetEncoding=xudp#${NODE_NAME// /%20}%20${NODE_TAG[3]}" \
-    "${NODE_NAME} ${NODE_TAG[3]}"
+  if grep -q 'vless-ws' <<< "$PROTOS_NOW"; then
+    local _tag3="${NODE_TAG[3]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag3}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vl\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"} }" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl?ed=2560&sni=${ARGO_DOMAIN}#${NODE_NAME// /%20}%20${_tag3}" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-vl%3Fed%3D2560#${NODE_NAME// /%20}%20${_tag3}" \
+      "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${_tag3}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vl\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol&packetEncoding=xudp#${NODE_NAME// /%20}%20${_tag3}" \
+      "${NODE_NAME} ${_tag3}"
+    local _tag3w="${_tag3}-warp"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag3w}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vl-warp\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"} }" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl-warp?ed=2560&sni=${ARGO_DOMAIN}#${NODE_NAME// /%20}%20${_tag3w}" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-vl-warp%3Fed%3D2560#${NODE_NAME// /%20}%20${_tag3w}" \
+      "{ \"type\":\"vless\", \"tag\":\"${NODE_NAME} ${_tag3w}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vl-warp\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vl-warp&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol&packetEncoding=xudp#${NODE_NAME// /%20}%20${_tag3w}" \
+      "${NODE_NAME} ${_tag3w}"
+  fi
 
   # vmess-ws
-  grep -q 'vmess-ws' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[4]}\", type: vmess, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, alterId: 0, cipher: none, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vm\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"}}" \
-    "vmess://$(echo -n "none:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${NODE_TAG[4]}&obfsParam=${ARGO_DOMAIN}&path=/${WS_PATH}-vm?ed=2560&obfs=websocket&tls=1&peer=${ARGO_DOMAIN}&alterId=0" \
-    "vmess://$(echo -n "{ \"v\": \"2\", \"ps\": \"${NODE_NAME} ${NODE_TAG[4]}\", \"add\": \"${SERVER}\", \"port\": \"443\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_DOMAIN}\", \"path\": \"/${WS_PATH}-vm?ed=2560\", \"tls\": \"tls\", \"sni\": \"${ARGO_DOMAIN}\", \"alpn\": \"\" }" | base64 -w0)" \
-    "{ \"type\":\"vmess\", \"tag\":\"${NODE_NAME} ${NODE_TAG[4]}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vm\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
-    "vmess://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vm&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol#${NODE_NAME// /%20}%20${NODE_TAG[4]}" \
-    "${NODE_NAME} ${NODE_TAG[4]}"
+  if grep -q 'vmess-ws' <<< "$PROTOS_NOW"; then
+    local _tag4="${NODE_TAG[4]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag4}\", type: vmess, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, alterId: 0, cipher: none, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vm\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"}}" \
+      "vmess://$(echo -n "none:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag4}&obfsParam=${ARGO_DOMAIN}&path=/${WS_PATH}-vm?ed=2560&obfs=websocket&tls=1&peer=${ARGO_DOMAIN}&alterId=0" \
+      "vmess://$(echo -n "{ \"v\": \"2\", \"ps\": \"${NODE_NAME} ${_tag4}\", \"add\": \"${SERVER}\", \"port\": \"443\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_DOMAIN}\", \"path\": \"/${WS_PATH}-vm?ed=2560\", \"tls\": \"tls\", \"sni\": \"${ARGO_DOMAIN}\", \"alpn\": \"\" }" | base64 -w0)" \
+      "{ \"type\":\"vmess\", \"tag\":\"${NODE_NAME} ${_tag4}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vm\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "vmess://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vm&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol#${NODE_NAME// /%20}%20${_tag4}" \
+      "${NODE_NAME} ${_tag4}"
+    local _tag4w="${_tag4}-warp"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag4w}\", type: vmess, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, alterId: 0, cipher: none, tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-vm-warp\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\"}}" \
+      "vmess://$(echo -n "none:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?remarks=${NODE_NAME// /%20}%20${_tag4w}&obfsParam=${ARGO_DOMAIN}&path=/${WS_PATH}-vm-warp?ed=2560&obfs=websocket&tls=1&peer=${ARGO_DOMAIN}&alterId=0" \
+      "vmess://$(echo -n "{ \"v\": \"2\", \"ps\": \"${NODE_NAME} ${_tag4w}\", \"add\": \"${SERVER}\", \"port\": \"443\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_DOMAIN}\", \"path\": \"/${WS_PATH}-vm-warp?ed=2560\", \"tls\": \"tls\", \"sni\": \"${ARGO_DOMAIN}\", \"alpn\": \"\" }" | base64 -w0)" \
+      "{ \"type\":\"vmess\", \"tag\":\"${NODE_NAME} ${_tag4w}\", \"server\":\"${SERVER}\", \"server_port\":${SERVER_PORT_NOW}, \"uuid\":\"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-vm-warp\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "vmess://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-vm-warp&max_early_data=2560&early_data_header_name=Sec-WebSocket-Protocol#${NODE_NAME// /%20}%20${_tag4w}" \
+      "${NODE_NAME} ${_tag4w}"
+  fi
 
   # trojan-ws
-  grep -q 'trojan-ws' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[5]}\", type: trojan, server: ${SERVER}, port: ${SERVER_PORT_NOW}, password: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, sni: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-tr\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
-    "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?peer=${ARGO_DOMAIN}&plugin=obfs-local;obfs=websocket;obfs-host=${ARGO_DOMAIN};obfs-uri=/${WS_PATH}-tr?ed=2560#${NODE_NAME// /%20}%20${NODE_TAG[5]}" \
-    "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr?ed%3D2560#${NODE_NAME// /%20}%20${NODE_TAG[5]}" \
-    "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${NODE_TAG[5]}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"password\": \"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-tr\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
-    "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr#${NODE_NAME// /%20}%20${NODE_TAG[5]}" \
-    "${NODE_NAME} ${NODE_TAG[5]}"
+  if grep -q 'trojan-ws' <<< "$PROTOS_NOW"; then
+    local _tag5="${NODE_TAG[5]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag5}\", type: trojan, server: ${SERVER}, port: ${SERVER_PORT_NOW}, password: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, sni: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-tr\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?peer=${ARGO_DOMAIN}&plugin=obfs-local;obfs=websocket;obfs-host=${ARGO_DOMAIN};obfs-uri=/${WS_PATH}-tr?ed=2560#${NODE_NAME// /%20}%20${_tag5}" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr?ed%3D2560#${NODE_NAME// /%20}%20${_tag5}" \
+      "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${_tag5}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"password\": \"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-tr\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr#${NODE_NAME// /%20}%20${_tag5}" \
+      "${NODE_NAME} ${_tag5}"
+    local _tag5w="${_tag5}-warp"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag5w}\", type: trojan, server: ${SERVER}, port: ${SERVER_PORT_NOW}, password: ${UUID}, udp: true, tls: true, servername: ${ARGO_DOMAIN}, sni: ${ARGO_DOMAIN}, skip-cert-verify: false, network: ws, ws-opts: {path: \"/${WS_PATH}-tr-warp\", headers: {Host: ${ARGO_DOMAIN}}, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?peer=${ARGO_DOMAIN}&plugin=obfs-local;obfs=websocket;obfs-host=${ARGO_DOMAIN};obfs-uri=/${WS_PATH}-tr-warp?ed=2560#${NODE_NAME// /%20}%20${_tag5w}" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr-warp?ed%3D2560#${NODE_NAME// /%20}%20${_tag5w}" \
+      "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${_tag5w}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"password\": \"${UUID}\", \"tls\": { \"enabled\":true, \"server_name\":\"${ARGO_DOMAIN}\", \"utls\": { \"enabled\":true, \"fingerprint\":\"chrome\" } }, \"transport\": { \"type\":\"ws\", \"path\":\"/${WS_PATH}-tr-warp\", \"headers\": { \"Host\": \"${ARGO_DOMAIN}\" }, \"max_early_data\":2560, \"early_data_header_name\":\"Sec-WebSocket-Protocol\" } }" \
+      "trojan://${UUID}@${SERVER}:${SERVER_PORT_NOW}?security=tls&sni=${ARGO_DOMAIN}&alpn&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=/${WS_PATH}-tr-warp#${NODE_NAME// /%20}%20${_tag5w}" \
+      "${NODE_NAME} ${_tag5w}"
+  fi
 
   # ss-ws
-  grep -qw 'ss-ws' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[6]}\", type: ss, server: ${SERVER}, port: ${SERVER_PORT_NOW}, cipher: ${SS_WS_METHOD}, password: ${UUID}, udp: true, plugin: v2ray-plugin, plugin-opts: { mode: websocket, host: ${ARGO_DOMAIN}, path: \"/${WS_PATH}-sh\", tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, mux: false } }" \
-    "ss://$(echo -n "${SS_WS_METHOD}:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?uot=2&v2ray-plugin=$(echo -n "{\"peer\":\"${ARGO_DOMAIN}\",\"mux\":false,\"path\":\"\\/${WS_PATH}-sh\",\"host\":\"${ARGO_DOMAIN}\",\"mode\":\"websocket\",\"tls\":true}" | base64 -w0)#${NODE_NAME// /%20}%20${NODE_TAG[6]}" \
-    "v2rayn://shadowsocks/$(echo -n "{\"ConfigType\":3,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${NODE_TAG[6]}\",\"Address\":\"${SERVER}\",\"Port\":${SERVER_PORT_NOW},\"Password\":\"${UUID}\",\"Network\":\"ws\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${ARGO_DOMAIN}\",\"Fingerprint\":\"chrome\",\"AlterId\":0,\"ProtoExtraObj\":{\"SsMethod\":\"${SS_WS_METHOD}\"},\"TransportExtraObj\":{\"Host\":\"${ARGO_DOMAIN}\",\"Path\":\"/${WS_PATH}-sh\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
-    "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${NODE_TAG[6]}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"method\": \"${SS_WS_METHOD}\", \"password\": \"${UUID}\", \"udp_over_tcp\": {\"enabled\": true,\"version\": 2}, \"plugin\": \"v2ray-plugin\", \"plugin_opts\": \"mode=websocket;host=${ARGO_DOMAIN};path=/${WS_PATH}-sh;tls=true;servername=${ARGO_DOMAIN};skip-cert-verify=false;mux=0\"}" \
-    "ss://$(echo -n "${SS_WS_METHOD}:${UUID}" | base64 -w0)@${SERVER}:${SERVER_PORT_NOW}?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3D${ARGO_DOMAIN}%3Bpath%3D%2F${WS_PATH}-sh%3Btls%3Dtrue%3Bservername%3D${ARGO_DOMAIN}%3Bskip-cert-verify%3Dfalse%3Bmux%3D0&uot=1#${NODE_NAME// /%20}%20${NODE_TAG[6]}" \
-    "${NODE_NAME} ${NODE_TAG[6]}"
+  if grep -qw 'ss-ws' <<< "$PROTOS_NOW"; then
+    local _tag6="${NODE_TAG[6]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag6}\", type: ss, server: ${SERVER}, port: ${SERVER_PORT_NOW}, cipher: ${SS_WS_METHOD}, password: ${UUID}, udp: true, plugin: v2ray-plugin, plugin-opts: { mode: websocket, host: ${ARGO_DOMAIN}, path: \"/${WS_PATH}-sh\", tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, mux: false } }" \
+      "ss://$(echo -n "${SS_WS_METHOD}:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?uot=2&v2ray-plugin=$(echo -n "{\"peer\":\"${ARGO_DOMAIN}\",\"mux\":false,\"path\":\"\\/${WS_PATH}-sh\",\"host\":\"${ARGO_DOMAIN}\",\"mode\":\"websocket\",\"tls\":true}" | base64 -w0)#${NODE_NAME// /%20}%20${_tag6}" \
+      "v2rayn://shadowsocks/$(echo -n "{\"ConfigType\":3,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag6}\",\"Address\":\"${SERVER}\",\"Port\":${SERVER_PORT_NOW},\"Password\":\"${UUID}\",\"Network\":\"ws\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${ARGO_DOMAIN}\",\"Fingerprint\":\"chrome\",\"AlterId\":0,\"ProtoExtraObj\":{\"SsMethod\":\"${SS_WS_METHOD}\"},\"TransportExtraObj\":{\"Host\":\"${ARGO_DOMAIN}\",\"Path\":\"/${WS_PATH}-sh\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+      "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${_tag6}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"method\": \"${SS_WS_METHOD}\", \"password\": \"${UUID}\", \"udp_over_tcp\": {\"enabled\": true,\"version\": 2}, \"plugin\": \"v2ray-plugin\", \"plugin_opts\": \"mode=websocket;host=${ARGO_DOMAIN};path=/${WS_PATH}-sh;tls=true;servername=${ARGO_DOMAIN};skip-cert-verify=false;mux=0\"}" \
+      "ss://$(echo -n "${SS_WS_METHOD}:${UUID}" | base64 -w0)@${SERVER}:${SERVER_PORT_NOW}?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3D${ARGO_DOMAIN}%3Bpath%3D%2F${WS_PATH}-sh%3Btls%3Dtrue%3Bservername%3D${ARGO_DOMAIN}%3Bskip-cert-verify%3Dfalse%3Bmux%3D0&uot=1#${NODE_NAME// /%20}%20${_tag6}" \
+      "${NODE_NAME} ${_tag6}"
+    local _tag6w="${_tag6}-warp"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag6w}\", type: ss, server: ${SERVER}, port: ${SERVER_PORT_NOW}, cipher: ${SS_WS_METHOD}, password: ${UUID}, udp: true, plugin: v2ray-plugin, plugin-opts: { mode: websocket, host: ${ARGO_DOMAIN}, path: \"/${WS_PATH}-sh-warp\", tls: true, servername: ${ARGO_DOMAIN}, skip-cert-verify: false, mux: false } }" \
+      "ss://$(echo -n "${SS_WS_METHOD}:${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?uot=2&v2ray-plugin=$(echo -n "{\"peer\":\"${ARGO_DOMAIN}\",\"mux\":false,\"path\":\"\\/${WS_PATH}-sh-warp\",\"host\":\"${ARGO_DOMAIN}\",\"mode\":\"websocket\",\"tls\":true}" | base64 -w0)#${NODE_NAME// /%20}%20${_tag6w}" \
+      "v2rayn://shadowsocks/$(echo -n "{\"ConfigType\":3,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag6w}\",\"Address\":\"${SERVER}\",\"Port\":${SERVER_PORT_NOW},\"Password\":\"${UUID}\",\"Network\":\"ws\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${ARGO_DOMAIN}\",\"Fingerprint\":\"chrome\",\"AlterId\":0,\"ProtoExtraObj\":{\"SsMethod\":\"${SS_WS_METHOD}\"},\"TransportExtraObj\":{\"Host\":\"${ARGO_DOMAIN}\",\"Path\":\"/${WS_PATH}-sh-warp\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+      "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${_tag6w}\", \"server\": \"${SERVER}\", \"server_port\": ${SERVER_PORT_NOW}, \"method\": \"${SS_WS_METHOD}\", \"password\": \"${UUID}\", \"udp_over_tcp\": {\"enabled\": true,\"version\": 2}, \"plugin\": \"v2ray-plugin\", \"plugin_opts\": \"mode=websocket;host=${ARGO_DOMAIN};path=/${WS_PATH}-sh-warp;tls=true;servername=${ARGO_DOMAIN};skip-cert-verify=false;mux=0\"}" \
+      "ss://$(echo -n "${SS_WS_METHOD}:${UUID}" | base64 -w0)@${SERVER}:${SERVER_PORT_NOW}?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3D${ARGO_DOMAIN}%3Bpath%3D%2F${WS_PATH}-sh-warp%3Btls%3Dtrue%3Bservername%3D${ARGO_DOMAIN}%3Bskip-cert-verify%3Dfalse%3Bmux%3D0&uot=1#${NODE_NAME// /%20}%20${_tag6w}" \
+      "${NODE_NAME} ${_tag6w}"
+  fi
 
   # xhttp-h1.1-cdn（固定隧道下输出，使用 HTTP/1.1）
-  grep -q 'xhttp-h1.1-cdn' <<< "$PROTOS_NOW" && ! grep -q 'trycloudflare\.com$' <<< "${ARGO_DOMAIN}" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[7]}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h2,http/1.1], servername: ${ARGO_DOMAIN}, client-fingerprint: chrome, encryption: \"\", xhttp-opts: {path: \"/${WS_PATH}-xh\", host: ${ARGO_DOMAIN}, mode: auto} }" \
-    "vless://$(echo -n ":${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?path=/${WS_PATH}-xh&remarks=${NODE_NAME// /%20}%20${NODE_TAG[7]}&obfsParam=%7B%22Host%22:%22${ARGO_DOMAIN}%22%7D&obfs=xhttp&tls=1&peer=${ARGO_DOMAIN}&alpn=h2,http/1.1&h2=1&mode=auto" \
-    "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh&mode=auto#${NODE_NAME// /%20}%20${NODE_TAG[7]}" \
-    "" \
-    "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh&mode=auto#${NODE_NAME// /%20}%20${NODE_TAG[7]}" \
-    ""
+  if grep -q 'xhttp-h1.1-cdn' <<< "$PROTOS_NOW" && ! grep -q 'trycloudflare\.com$' <<< "${ARGO_DOMAIN}"; then
+    local _tag7="${NODE_TAG[7]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag7}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h2,http/1.1], servername: ${ARGO_DOMAIN}, client-fingerprint: chrome, encryption: \"\", xhttp-opts: {path: \"/${WS_PATH}-xh\", host: ${ARGO_DOMAIN}, mode: auto} }" \
+      "vless://$(echo -n ":${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?path=/${WS_PATH}-xh&remarks=${NODE_NAME// /%20}%20${_tag7}&obfsParam=%7B%22Host%22:%22${ARGO_DOMAIN}%22%7D&obfs=xhttp&tls=1&peer=${ARGO_DOMAIN}&alpn=h2,http/1.1&h2=1&mode=auto" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh&mode=auto#${NODE_NAME// /%20}%20${_tag7}" \
+      "" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh&mode=auto#${NODE_NAME// /%20}%20${_tag7}" \
+      ""
+    local _tag7w="${_tag7}-warp"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag7w}\", type: vless, server: ${SERVER}, port: ${SERVER_PORT_NOW}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h2,http/1.1], servername: ${ARGO_DOMAIN}, client-fingerprint: chrome, encryption: \"\", xhttp-opts: {path: \"/${WS_PATH}-xh-warp\", host: ${ARGO_DOMAIN}, mode: auto} }" \
+      "vless://$(echo -n ":${UUID}@${SERVER}:${SERVER_PORT_NOW}" | base64 -w0)?path=/${WS_PATH}-xh-warp&remarks=${NODE_NAME// /%20}%20${_tag7w}&obfsParam=%7B%22Host%22:%22${ARGO_DOMAIN}%22%7D&obfs=xhttp&tls=1&peer=${ARGO_DOMAIN}&alpn=h2,http/1.1&h2=1&mode=auto" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh-warp&mode=auto#${NODE_NAME// /%20}%20${_tag7w}" \
+      "" \
+      "vless://${UUID}@${SERVER}:${SERVER_PORT_NOW}?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1&type=xhttp&host=${ARGO_DOMAIN}&path=%2F${WS_PATH}-xh-warp&mode=auto#${NODE_NAME// /%20}%20${_tag7w}" \
+      ""
+  fi
 
   # xhttp-h3-direct
-  grep -q 'xhttp-h3-direct' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[8]}\", type: vless, server: ${SERVER_IP}, port: ${XHTTP_PORT}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h3], servername: ${CERT_SNI}, client-fingerprint: chrome, skip-cert-verify: false, fingerprint: ${FP_SHA256}, xhttp-opts: {path: \"/${WS_PATH}-xh3\", mode: stream-up} }" \
-    "vless://$(echo -n \"auto:${UUID}@${SERVER_IP_1}:${XHTTP_PORT}\" | base64 -w0)?path=/${WS_PATH}-xh3&remarks=${NODE_NAME// /%20}%20${NODE_TAG[8]}&obfs=xhttp&tls=1&peer=${CERT_SNI}&alpn=h3&mode=stream-up&hpkp=${FP_SHA256}" \
-    "v2rayn://vless/$(echo -n "{\"ConfigType\":5,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${NODE_TAG[8]}\",\"Address\":\"${SERVER_IP}\",\"Port\":${XHTTP_PORT},\"Password\":\"${UUID}\",\"Network\":\"xhttp\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Alpn\":\"h3\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\",\"TransportExtraObj\":{\"Path\":\"/${WS_PATH}-xh3\",\"XhttpMode\":\"stream-up\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
-    "" \
-    "vless://${UUID}@${SERVER_IP_1}:${XHTTP_PORT}?encryption=none&security=tls&sni=${CERT_SNI}&fp=chrome&alpn=h3&pcs=${FP_SHA256//:/}&type=xhttp&path=%2F${WS_PATH}-xh3&mode=stream-up#${NODE_NAME// /%20}%20${NODE_TAG[8]}" \
-    ""
+  if grep -q 'xhttp-h3-direct' <<< "$PROTOS_NOW"; then
+    local _tag8="${NODE_TAG[8]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag8}\", type: vless, server: ${SERVER_IP}, port: ${XHTTP_PORT}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h3], servername: ${CERT_SNI}, client-fingerprint: chrome, skip-cert-verify: false, fingerprint: ${FP_SHA256}, xhttp-opts: {path: \"/${WS_PATH}-xh3\", mode: stream-up} }" \
+      "vless://$(echo -n \"auto:${UUID}@${SERVER_IP_1}:${XHTTP_PORT}\" | base64 -w0)?path=/${WS_PATH}-xh3&remarks=${NODE_NAME// /%20}%20${_tag8}&obfs=xhttp&tls=1&peer=${CERT_SNI}&alpn=h3&mode=stream-up&hpkp=${FP_SHA256}" \
+      "v2rayn://vless/$(echo -n "{\"ConfigType\":5,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag8}\",\"Address\":\"${SERVER_IP}\",\"Port\":${XHTTP_PORT},\"Password\":\"${UUID}\",\"Network\":\"xhttp\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Alpn\":\"h3\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\",\"TransportExtraObj\":{\"Path\":\"/${WS_PATH}-xh3\",\"XhttpMode\":\"stream-up\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+      "" \
+      "vless://${UUID}@${SERVER_IP_1}:${XHTTP_PORT}?encryption=none&security=tls&sni=${CERT_SNI}&fp=chrome&alpn=h3&pcs=${FP_SHA256//:/}&type=xhttp&path=%2F${WS_PATH}-xh3&mode=stream-up#${NODE_NAME// /%20}%20${_tag8}" \
+      ""
+    if [ -n "$XHTTP_WARP_PORT" ]; then
+      local _tag8w="${_tag8}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag8w}\", type: vless, server: ${SERVER_IP}, port: ${XHTTP_WARP_PORT}, uuid: ${UUID}, udp: true, tls: true, network: xhttp, alpn: [h3], servername: ${CERT_SNI}, client-fingerprint: chrome, skip-cert-verify: false, fingerprint: ${FP_SHA256}, xhttp-opts: {path: \"/${WS_PATH}-xh3-warp\", mode: stream-up} }" \
+        "vless://$(echo -n \"auto:${UUID}@${SERVER_IP_1}:${XHTTP_WARP_PORT}\" | base64 -w0)?path=/${WS_PATH}-xh3-warp&remarks=${NODE_NAME// /%20}%20${_tag8w}&obfs=xhttp&tls=1&peer=${CERT_SNI}&alpn=h3&mode=stream-up&hpkp=${FP_SHA256}" \
+        "v2rayn://vless/$(echo -n "{\"ConfigType\":5,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag8w}\",\"Address\":\"${SERVER_IP}\",\"Port\":${XHTTP_WARP_PORT},\"Password\":\"${UUID}\",\"Network\":\"xhttp\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Alpn\":\"h3\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\",\"TransportExtraObj\":{\"Path\":\"/${WS_PATH}-xh3-warp\",\"XhttpMode\":\"stream-up\"}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+        "" \
+        "vless://${UUID}@${SERVER_IP_1}:${XHTTP_WARP_PORT}?encryption=none&security=tls&sni=${CERT_SNI}&fp=chrome&alpn=h3&pcs=${FP_SHA256//:/}&type=xhttp&path=%2F${WS_PATH}-xh3-warp&mode=stream-up#${NODE_NAME// /%20}%20${_tag8w}" \
+        ""
+    fi
+  fi
 
   # trojan-direct
-  grep -q 'trojan-direct' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[9]}\", type: trojan, server: ${SERVER_IP}, port: ${TROJAN_PORT}, password: ${UUID}, udp: true, tls: true, sni: ${CERT_SNI}, servername: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256} }" \
-    "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_PORT}?peer=${CERT_SNI}&tls=1&allowInsecure=0&sni=${CERT_SNI}&hpkp=${FP_SHA256}#${NODE_NAME// /%20}%20${NODE_TAG[9]}" \
-    "v2rayn://trojan/$(echo -n "{\"ConfigType\":6,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${NODE_TAG[9]}\",\"Address\":\"${SERVER_IP}\",\"Port\":${TROJAN_PORT},\"Password\":\"${UUID}\",\"Network\":\"raw\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
-    "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${NODE_TAG[9]}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${TROJAN_PORT}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"] } }" \
-    "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_PORT}?security=tls&sni=${TLS_SERVER}&tls_certificate=${CERT_URL_1}&fp=chrome#${NODE_NAME// /%20}%20${NODE_TAG[9]}" \
-    "${NODE_NAME} ${NODE_TAG[9]}"
+  if grep -q 'trojan-direct' <<< "$PROTOS_NOW"; then
+    local _tag9="${NODE_TAG[9]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag9}\", type: trojan, server: ${SERVER_IP}, port: ${TROJAN_PORT}, password: ${UUID}, udp: true, tls: true, sni: ${CERT_SNI}, servername: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256} }" \
+      "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_PORT}?peer=${CERT_SNI}&tls=1&allowInsecure=0&sni=${CERT_SNI}&hpkp=${FP_SHA256}#${NODE_NAME// /%20}%20${_tag9}" \
+      "v2rayn://trojan/$(echo -n "{\"ConfigType\":6,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag9}\",\"Address\":\"${SERVER_IP}\",\"Port\":${TROJAN_PORT},\"Password\":\"${UUID}\",\"Network\":\"raw\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+      "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${_tag9}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${TROJAN_PORT}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"] } }" \
+      "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_PORT}?security=tls&sni=${TLS_SERVER}&tls_certificate=${CERT_URL_1}&fp=chrome#${NODE_NAME// /%20}%20${_tag9}" \
+      "${NODE_NAME} ${_tag9}"
+    if [ -n "$TROJAN_WARP_PORT" ]; then
+      local _tag9w="${_tag9}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag9w}\", type: trojan, server: ${SERVER_IP}, port: ${TROJAN_WARP_PORT}, password: ${UUID}, udp: true, tls: true, sni: ${CERT_SNI}, servername: ${CERT_SNI}, skip-cert-verify: false, fingerprint: ${FP_SHA256} }" \
+        "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_WARP_PORT}?peer=${CERT_SNI}&tls=1&allowInsecure=0&sni=${CERT_SNI}&hpkp=${FP_SHA256}#${NODE_NAME// /%20}%20${_tag9w}" \
+        "v2rayn://trojan/$(echo -n "{\"ConfigType\":6,\"ConfigVersion\":4,\"Remarks\":\"${NODE_NAME} ${_tag9w}\",\"Address\":\"${SERVER_IP}\",\"Port\":${TROJAN_WARP_PORT},\"Password\":\"${UUID}\",\"Network\":\"raw\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${CERT_SNI}\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" \
+        "{ \"type\":\"trojan\", \"tag\":\"${NODE_NAME} ${_tag9w}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${TROJAN_WARP_PORT}, \"password\": \"${UUID}\", \"tls\": { \"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"certificate_public_key_sha256\": [\"${FP_BASE64}\"] } }" \
+        "trojan://${UUID}@${SERVER_IP_1}:${TROJAN_WARP_PORT}?security=tls&sni=${TLS_SERVER}&tls_certificate=${CERT_URL_1}&fp=chrome#${NODE_NAME// /%20}%20${_tag9w}" \
+        "${NODE_NAME} ${_tag9w}"
+    fi
+  fi
 
   # ss2022-direct
-  grep -q 'ss2022-direct' <<< "$PROTOS_NOW" && _add \
-    "{name: \"${NODE_NAME} ${NODE_TAG[10]}\", type: ss, server: ${SERVER_IP}, port: ${SS2022_PORT}, cipher: ${SS_DIRECT_METHOD}, password: ${SS2022_PASSWORD}, udp: true }" \
-    "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_PORT}" | base64 -w0)#$(echo -n "${NODE_NAME# }" | sed 's/ /%20/g')%20${NODE_TAG[10]}" \
-    "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}" | base64 -w0)@${SERVER_IP_1}:${SS2022_PORT}#${NODE_NAME// /%20}%20${NODE_TAG[10]}" \
-    "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${NODE_TAG[10]}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${SS2022_PORT}, \"method\": \"${SS_DIRECT_METHOD}\", \"password\": \"${SS2022_PASSWORD}\" }" \
-    "ss://${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_PORT}#${NODE_NAME// /%20}%20${NODE_TAG[10]}" \
-    "${NODE_NAME} ${NODE_TAG[10]}"
+  if grep -q 'ss2022-direct' <<< "$PROTOS_NOW"; then
+    local _tag10="${NODE_TAG[10]}"
+    _add \
+      "{name: \"${NODE_NAME} ${_tag10}\", type: ss, server: ${SERVER_IP}, port: ${SS2022_PORT}, cipher: ${SS_DIRECT_METHOD}, password: ${SS2022_PASSWORD}, udp: true }" \
+      "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_PORT}" | base64 -w0)#$(echo -n "${NODE_NAME# }" | sed 's/ /%20/g')%20${_tag10}" \
+      "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}" | base64 -w0)@${SERVER_IP_1}:${SS2022_PORT}#${NODE_NAME// /%20}%20${_tag10}" \
+      "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${_tag10}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${SS2022_PORT}, \"method\": \"${SS_DIRECT_METHOD}\", \"password\": \"${SS2022_PASSWORD}\" }" \
+      "ss://${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_PORT}#${NODE_NAME// /%20}%20${_tag10}" \
+      "${NODE_NAME} ${_tag10}"
+    if [ -n "$SS2022_WARP_PORT" ]; then
+      local _tag10w="${_tag10}-warp"
+      _add \
+        "{name: \"${NODE_NAME} ${_tag10w}\", type: ss, server: ${SERVER_IP}, port: ${SS2022_WARP_PORT}, cipher: ${SS_DIRECT_METHOD}, password: ${SS2022_PASSWORD}, udp: true }" \
+        "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_WARP_PORT}" | base64 -w0)#$(echo -n "${NODE_NAME# }" | sed 's/ /%20/g')%20${_tag10w}" \
+        "ss://$(echo -n "${SS_DIRECT_METHOD}:${SS2022_PASSWORD}" | base64 -w0)@${SERVER_IP_1}:${SS2022_WARP_PORT}#${NODE_NAME// /%20}%20${_tag10w}" \
+        "{ \"type\": \"shadowsocks\", \"tag\": \"${NODE_NAME} ${_tag10w}\", \"server\": \"${SERVER_IP}\", \"server_port\": ${SS2022_WARP_PORT}, \"method\": \"${SS_DIRECT_METHOD}\", \"password\": \"${SS2022_PASSWORD}\" }" \
+        "ss://${SS_DIRECT_METHOD}:${SS2022_PASSWORD}@${SERVER_IP_1}:${SS2022_WARP_PORT}#${NODE_NAME// /%20}%20${_tag10w}" \
+        "${NODE_NAME} ${_tag10w}"
+    fi
+  fi
 
   # 写入订阅文件
   echo -e "$CLASH" > $WORK_DIR/subscribe/proxies
@@ -3541,7 +3801,8 @@ change_protocols() {
     [ "$tag" = 'hysteria2' ] && del_port_hopping_nat
     if [ -x "$WORK_DIR/jq" ]; then
       grep -v '^//' $WORK_DIR/inbound.json > $TEMP_DIR/inbound_clean.json
-      $WORK_DIR/jq "del(.inbounds[] | select(.tag | split(\" \")[-1] == \"$tag\"))" \
+      # 同时删除普通与 -warp 两套 inbound
+      $WORK_DIR/jq "del(.inbounds[] | select((.tag | split(\" \")[-1]) == \"$tag\" or (.tag | split(\" \")[-1]) == \"${tag}-warp\"))" \
         $TEMP_DIR/inbound_clean.json > $TEMP_DIR/inbound_tmp.json \
       && mv $TEMP_DIR/inbound_tmp.json $WORK_DIR/inbound.json
     fi
@@ -3568,52 +3829,87 @@ change_protocols() {
 
   local _USED_PORTS=()
   for tag in "${REINSTALL_TAGS[@]}"; do
-    local _EXIST_PORT
+    local _EXIST_PORT _EXIST_WARP_PORT
     _EXIST_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r "[.inbounds[] | select(.tag | split(\" \")[-1] == \"$tag\") | .port] | .[0] // empty" 2>/dev/null)
+    _EXIST_WARP_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r "[.inbounds[] | select(.tag | split(\" \")[-1] == \"${tag}-warp\") | .port] | .[0] // empty" 2>/dev/null)
     if [ -n "$_EXIST_PORT" ]; then
       _USED_PORTS+=("$_EXIST_PORT")
+      [ -n "$_EXIST_WARP_PORT" ] && _USED_PORTS+=("$_EXIST_WARP_PORT")
       case "$tag" in
-        reality-vision) REALITY_PORT=$_EXIST_PORT ;;
-        hysteria2) HY2_PORT=$_EXIST_PORT ;;
-        reality-grpc) GRPC_PORT=$_EXIST_PORT ;;
-        vless-ws) VLESS_WS_PORT=$_EXIST_PORT ;;
-        vmess-ws) VMESS_WS_PORT=$_EXIST_PORT ;;
-        trojan-ws) TROJAN_WS_PORT=$_EXIST_PORT ;;
-        ss-ws) SS_WS_PORT=$_EXIST_PORT ;;
-        xhttp-h1.1-cdn) VLESS_XHTTP_PORT=$_EXIST_PORT ;;
-        xhttp-h3-direct) XHTTP_PORT=$_EXIST_PORT ;;
-        trojan-direct) TROJAN_PORT=$_EXIST_PORT ;;
-        ss2022-direct) SS2022_PORT=$_EXIST_PORT ;;
+        reality-vision) REALITY_PORT=$_EXIST_PORT; REALITY_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        hysteria2) HY2_PORT=$_EXIST_PORT; HY2_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        reality-grpc) GRPC_PORT=$_EXIST_PORT; GRPC_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        vless-ws) VLESS_WS_PORT=$_EXIST_PORT; VLESS_WS_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        vmess-ws) VMESS_WS_PORT=$_EXIST_PORT; VMESS_WS_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        trojan-ws) TROJAN_WS_PORT=$_EXIST_PORT; TROJAN_WS_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        ss-ws) SS_WS_PORT=$_EXIST_PORT; SS_WS_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        xhttp-h1.1-cdn) VLESS_XHTTP_PORT=$_EXIST_PORT; VLESS_XHTTP_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        xhttp-h3-direct) XHTTP_PORT=$_EXIST_PORT; XHTTP_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        trojan-direct) TROJAN_PORT=$_EXIST_PORT; TROJAN_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
+        ss2022-direct) SS2022_PORT=$_EXIST_PORT; SS2022_WARP_PORT=${_EXIST_WARP_PORT:-} ;;
       esac
     fi
   done
 
   local _SCAN_PORT
-  _SCAN_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[].port] | min // empty' 2>/dev/null)
-  _SCAN_PORT=${_SCAN_PORT:-$START_PORT_DEFAULT}
+  _SCAN_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r '[.inbounds[].port] | max // empty' 2>/dev/null)
+  if [ -n "$_SCAN_PORT" ]; then
+    (( _SCAN_PORT++ ))
+  else
+    _SCAN_PORT=$START_PORT_DEFAULT
+  fi
 
+  # 为每个协议分配普通端口 + WARP 端口（缺失则补齐）
   for tag in "${REINSTALL_TAGS[@]}"; do
-    local _EXIST_PORT
+    local _EXIST_PORT _EXIST_WARP_PORT _NEW_PORT _NEW_WARP_PORT
     _EXIST_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r "[.inbounds[] | select(.tag | split(\" \")[-1] == \"$tag\") | .port] | .[0] // empty" 2>/dev/null)
+    _EXIST_WARP_PORT=$(echo "$_JSON_CLEAN" | $WORK_DIR/jq -r "[.inbounds[] | select(.tag | split(\" \")[-1] == \"${tag}-warp\") | .port] | .[0] // empty" 2>/dev/null)
     if [ -z "$_EXIST_PORT" ]; then
       while printf '%s\n' "${_USED_PORTS[@]}" | grep -qx "$_SCAN_PORT"; do
         (( _SCAN_PORT++ ))
       done
-      local _NEW_PORT=$_SCAN_PORT
+      _NEW_PORT=$_SCAN_PORT
+      _USED_PORTS+=("$_SCAN_PORT")
+      (( _SCAN_PORT++ ))
+      while printf '%s\n' "${_USED_PORTS[@]}" | grep -qx "$_SCAN_PORT"; do
+        (( _SCAN_PORT++ ))
+      done
+      _NEW_WARP_PORT=$_SCAN_PORT
       _USED_PORTS+=("$_SCAN_PORT")
       (( _SCAN_PORT++ ))
       case "$tag" in
-        reality-vision) REALITY_PORT=$_NEW_PORT ;;
-        hysteria2) HY2_PORT=$_NEW_PORT ;;
-        reality-grpc) GRPC_PORT=$_NEW_PORT ;;
-        vless-ws) VLESS_WS_PORT=$_NEW_PORT ;;
-        vmess-ws) VMESS_WS_PORT=$_NEW_PORT ;;
-        trojan-ws) TROJAN_WS_PORT=$_NEW_PORT ;;
-        ss-ws) SS_WS_PORT=$_NEW_PORT ;;
-        xhttp-h1.1-cdn) VLESS_XHTTP_PORT=$_NEW_PORT ;;
-        xhttp-h3-direct) XHTTP_PORT=$_NEW_PORT ;;
-        trojan-direct) TROJAN_PORT=$_NEW_PORT ;;
-        ss2022-direct) SS2022_PORT=$_NEW_PORT ;;
+        reality-vision) REALITY_PORT=$_NEW_PORT; REALITY_WARP_PORT=$_NEW_WARP_PORT ;;
+        hysteria2) HY2_PORT=$_NEW_PORT; HY2_WARP_PORT=$_NEW_WARP_PORT ;;
+        reality-grpc) GRPC_PORT=$_NEW_PORT; GRPC_WARP_PORT=$_NEW_WARP_PORT ;;
+        vless-ws) VLESS_WS_PORT=$_NEW_PORT; VLESS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        vmess-ws) VMESS_WS_PORT=$_NEW_PORT; VMESS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        trojan-ws) TROJAN_WS_PORT=$_NEW_PORT; TROJAN_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        ss-ws) SS_WS_PORT=$_NEW_PORT; SS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        xhttp-h1.1-cdn) VLESS_XHTTP_PORT=$_NEW_PORT; VLESS_XHTTP_WARP_PORT=$_NEW_WARP_PORT ;;
+        xhttp-h3-direct) XHTTP_PORT=$_NEW_PORT; XHTTP_WARP_PORT=$_NEW_WARP_PORT ;;
+        trojan-direct) TROJAN_PORT=$_NEW_PORT; TROJAN_WARP_PORT=$_NEW_WARP_PORT ;;
+        ss2022-direct) SS2022_PORT=$_NEW_PORT; SS2022_WARP_PORT=$_NEW_WARP_PORT ;;
+      esac
+    elif [ -z "$_EXIST_WARP_PORT" ]; then
+      # 旧版只有普通 inbound：补齐 WARP 端口
+      while printf '%s\n' "${_USED_PORTS[@]}" | grep -qx "$_SCAN_PORT"; do
+        (( _SCAN_PORT++ ))
+      done
+      _NEW_WARP_PORT=$_SCAN_PORT
+      _USED_PORTS+=("$_SCAN_PORT")
+      (( _SCAN_PORT++ ))
+      case "$tag" in
+        reality-vision) REALITY_WARP_PORT=$_NEW_WARP_PORT ;;
+        hysteria2) HY2_WARP_PORT=$_NEW_WARP_PORT ;;
+        reality-grpc) GRPC_WARP_PORT=$_NEW_WARP_PORT ;;
+        vless-ws) VLESS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        vmess-ws) VMESS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        trojan-ws) TROJAN_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        ss-ws) SS_WS_WARP_PORT=$_NEW_WARP_PORT ;;
+        xhttp-h1.1-cdn) VLESS_XHTTP_WARP_PORT=$_NEW_WARP_PORT ;;
+        xhttp-h3-direct) XHTTP_WARP_PORT=$_NEW_WARP_PORT ;;
+        trojan-direct) TROJAN_WARP_PORT=$_NEW_WARP_PORT ;;
+        ss2022-direct) SS2022_WARP_PORT=$_NEW_WARP_PORT ;;
       esac
     fi
   done
@@ -3704,30 +4000,39 @@ change_protocols() {
 EOF
 
   for tag in "${REINSTALL_TAGS[@]}"; do
-    local NEW_BLOCK=''
+    local NEW_BLOCK='' _WARP_PORT=''
     case "$tag" in
-      hysteria2) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[1]}\",\"protocol\":\"hysteria\",\"port\":${HY2_PORT},\"settings\":{\"version\":2,\"clients\":[{\"auth\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"hysteria\",\"security\":\"tls\",\"tlsSettings\":{\"serverNames\":[\"${TLS_SERVER}\"],\"alpn\":[\"h3\"],\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}}}" ;;
-      vless-ws) NEW_BLOCK="{\"port\":${VLESS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[3]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"level\":0}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"/${WS_PATH}-vl\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      vmess-ws) NEW_BLOCK="{\"port\":${VMESS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vmess\",\"tag\":\"${NODE_NAME} ${NODE_TAG[4]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"alterId\":0}]},\"streamSettings\":{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/${WS_PATH}-vm\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      trojan-ws) NEW_BLOCK="{\"port\":${TROJAN_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"trojan\",\"tag\":\"${NODE_NAME} ${NODE_TAG[5]}\",\"settings\":{\"clients\":[{\"password\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"/${WS_PATH}-tr\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      ss-ws) NEW_BLOCK="{\"port\":${SS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"shadowsocks\",\"tag\":\"${NODE_NAME} ${NODE_TAG[6]}\",\"settings\":{\"clients\":[{\"method\":\"${SS_WS_METHOD}\",\"password\":\"${UUID}\"}],\"network\":\"tcp,udp\"},\"streamSettings\":{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/${WS_PATH}-sh\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      xhttp-h1.1-cdn) NEW_BLOCK="{\"port\":${VLESS_XHTTP_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[7]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"level\":0}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"xhttp\",\"security\":\"none\",\"xhttpSettings\":{\"path\":\"/${WS_PATH}-xh\",\"mode\":\"auto\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      xhttp-h3-direct) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[8]}\",\"port\":${XHTTP_PORT},\"protocol\":\"vless\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"xhttp\",\"security\":\"tls\",\"xhttpSettings\":{\"mode\":\"stream-up\",\"extra\":{\"alpn\":[\"h3\"]},\"path\":\"/${WS_PATH}-xh3\"},\"tlsSettings\":{\"serverName\":\"${TLS_SERVER}\",\"alpn\":[\"h3\"],\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}}" ;;
-      trojan-direct) NEW_BLOCK="{\"port\":${TROJAN_PORT},\"protocol\":\"trojan\",\"tag\":\"${NODE_NAME} ${NODE_TAG[9]}\",\"settings\":{\"clients\":[{\"password\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${TLS_SERVER}\",\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      ss2022-direct) NEW_BLOCK="{\"port\":${SS2022_PORT},\"protocol\":\"shadowsocks\",\"tag\":\"${NODE_NAME} ${NODE_TAG[10]}\",\"settings\":{\"method\":\"${SS_DIRECT_METHOD}\",\"password\":\"${SS2022_PASSWORD}\",\"network\":\"tcp,udp\"},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}" ;;
-      reality-vision) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[0]}\",\"protocol\":\"vless\",\"port\":${REALITY_PORT},\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"flow\":\"xtls-rprx-vision\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"${TLS_SERVER}:443\",\"xver\":0,\"serverNames\":[\"${TLS_SERVER}\"],\"privateKey\":\"${REALITY_PRIVATE}\",\"publicKey\":\"${REALITY_PUBLIC}\",\"shortIds\":[\"\"]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}}" ;;
-      reality-grpc) NEW_BLOCK="{\"port\":${GRPC_PORT},\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[2]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"flow\":\"\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"grpc\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"${TLS_SERVER}:443\",\"xver\":0,\"serverNames\":[\"${TLS_SERVER}\"],\"privateKey\":\"${REALITY_PRIVATE}\",\"publicKey\":\"${REALITY_PUBLIC}\",\"shortIds\":[\"\"]},\"grpcSettings\":{\"serviceName\":\"grpc\",\"multiMode\":true}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}}" ;;
+      hysteria2) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[1]}\",\"protocol\":\"hysteria\",\"port\":${HY2_PORT},\"settings\":{\"version\":2,\"clients\":[{\"auth\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"hysteria\",\"security\":\"tls\",\"tlsSettings\":{\"serverNames\":[\"${TLS_SERVER}\"],\"alpn\":[\"h3\"],\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}}}"; _WARP_PORT="$HY2_WARP_PORT" ;;
+      vless-ws) NEW_BLOCK="{\"port\":${VLESS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[3]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"level\":0}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"/${WS_PATH}-vl\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$VLESS_WS_WARP_PORT" ;;
+      vmess-ws) NEW_BLOCK="{\"port\":${VMESS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vmess\",\"tag\":\"${NODE_NAME} ${NODE_TAG[4]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"alterId\":0}]},\"streamSettings\":{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/${WS_PATH}-vm\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$VMESS_WS_WARP_PORT" ;;
+      trojan-ws) NEW_BLOCK="{\"port\":${TROJAN_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"trojan\",\"tag\":\"${NODE_NAME} ${NODE_TAG[5]}\",\"settings\":{\"clients\":[{\"password\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"/${WS_PATH}-tr\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$TROJAN_WS_WARP_PORT" ;;
+      ss-ws) NEW_BLOCK="{\"port\":${SS_WS_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"shadowsocks\",\"tag\":\"${NODE_NAME} ${NODE_TAG[6]}\",\"settings\":{\"clients\":[{\"method\":\"${SS_WS_METHOD}\",\"password\":\"${UUID}\"}],\"network\":\"tcp,udp\"},\"streamSettings\":{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/${WS_PATH}-sh\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$SS_WS_WARP_PORT" ;;
+      xhttp-h1.1-cdn) NEW_BLOCK="{\"port\":${VLESS_XHTTP_PORT},\"listen\":\"127.0.0.1\",\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[7]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"level\":0}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"xhttp\",\"security\":\"none\",\"xhttpSettings\":{\"path\":\"/${WS_PATH}-xh\",\"mode\":\"auto\"}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$VLESS_XHTTP_WARP_PORT" ;;
+      xhttp-h3-direct) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[8]}\",\"port\":${XHTTP_PORT},\"protocol\":\"vless\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"xhttp\",\"security\":\"tls\",\"xhttpSettings\":{\"mode\":\"stream-up\",\"extra\":{\"alpn\":[\"h3\"]},\"path\":\"/${WS_PATH}-xh3\"},\"tlsSettings\":{\"serverName\":\"${TLS_SERVER}\",\"alpn\":[\"h3\"],\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}}"; _WARP_PORT="$XHTTP_WARP_PORT" ;;
+      trojan-direct) NEW_BLOCK="{\"port\":${TROJAN_PORT},\"protocol\":\"trojan\",\"tag\":\"${NODE_NAME} ${NODE_TAG[9]}\",\"settings\":{\"clients\":[{\"password\":\"${UUID}\"}]},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${TLS_SERVER}\",\"certificates\":[{\"certificateFile\":\"${WORK_DIR}/cert/cert.pem\",\"keyFile\":\"${WORK_DIR}/cert/private.key\"}]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$TROJAN_WARP_PORT" ;;
+      ss2022-direct) NEW_BLOCK="{\"port\":${SS2022_PORT},\"protocol\":\"shadowsocks\",\"tag\":\"${NODE_NAME} ${NODE_TAG[10]}\",\"settings\":{\"method\":\"${SS_DIRECT_METHOD}\",\"password\":\"${SS2022_PASSWORD}\",\"network\":\"tcp,udp\"},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"],\"metadataOnly\":false}}"; _WARP_PORT="$SS2022_WARP_PORT" ;;
+      reality-vision) NEW_BLOCK="{\"tag\":\"${NODE_NAME} ${NODE_TAG[0]}\",\"protocol\":\"vless\",\"port\":${REALITY_PORT},\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"flow\":\"xtls-rprx-vision\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"${TLS_SERVER}:443\",\"xver\":0,\"serverNames\":[\"${TLS_SERVER}\"],\"privateKey\":\"${REALITY_PRIVATE}\",\"publicKey\":\"${REALITY_PUBLIC}\",\"shortIds\":[\"\"]}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}}"; _WARP_PORT="$REALITY_WARP_PORT" ;;
+      reality-grpc) NEW_BLOCK="{\"port\":${GRPC_PORT},\"protocol\":\"vless\",\"tag\":\"${NODE_NAME} ${NODE_TAG[2]}\",\"settings\":{\"clients\":[{\"id\":\"${UUID}\",\"flow\":\"\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"grpc\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"${TLS_SERVER}:443\",\"xver\":0,\"serverNames\":[\"${TLS_SERVER}\"],\"privateKey\":\"${REALITY_PRIVATE}\",\"publicKey\":\"${REALITY_PUBLIC}\",\"shortIds\":[\"\"]},\"grpcSettings\":{\"serviceName\":\"grpc\",\"multiMode\":true}},\"sniffing\":{\"enabled\":true,\"destOverride\":[\"http\",\"tls\"]}}"; _WARP_PORT="$GRPC_WARP_PORT" ;;
     esac
     if [ -n "$NEW_BLOCK" ] && [ -x "$WORK_DIR/jq" ]; then
-      $WORK_DIR/jq --argjson block "$NEW_BLOCK" '.inbounds += [$block]' \
-        $WORK_DIR/inbound.json > $TEMP_DIR/inbound_tmp.json \
-        && mv $TEMP_DIR/inbound_tmp.json $WORK_DIR/inbound.json
+      local WARP_BLOCK=''
+      [ -n "$_WARP_PORT" ] && WARP_BLOCK=$(make_warp_inbound "$NEW_BLOCK" "$tag" "$_WARP_PORT")
+      if [ -n "$WARP_BLOCK" ]; then
+        $WORK_DIR/jq --argjson block "$NEW_BLOCK" --argjson wblock "$WARP_BLOCK" '.inbounds += [$block, $wblock]' \
+          $WORK_DIR/inbound.json > $TEMP_DIR/inbound_tmp.json \
+          && mv $TEMP_DIR/inbound_tmp.json $WORK_DIR/inbound.json
+      else
+        $WORK_DIR/jq --argjson block "$NEW_BLOCK" '.inbounds += [$block]' \
+          $WORK_DIR/inbound.json > $TEMP_DIR/inbound_tmp.json \
+          && mv $TEMP_DIR/inbound_tmp.json $WORK_DIR/inbound.json
+      fi
     fi
 
   done
 
   mapfile -t CURRENT_PROTOCOLS < <(get_installed_protocols)
 
+  write_outbound_json
   json_nginx
   [ -s "$WORK_DIR/tunnel.json" ] && json_argo
   local _NGINX_PID=$(pgrep -f "nginx: master process" 2>/dev/null)

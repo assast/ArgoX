@@ -20,6 +20,8 @@
 
 * * *
 ## 更新信息
+2026.07.13 v2.0.8 每个协议同时生成 2 个节点：原生出口 IP + 套 WARP 出口 IP（服务端 inboundTag 分流）
+
 2026.06.04 v2.0.7 1. 使用 Throne 替代 Nekobox 进行客户端输出; 2. 独立生成 v2rayN 配置; 3. 安全升级：移除 insecure=true，启用 TLS 证书指纹校验
 
 2026.04.21 v2.0.6 1. 保持 CDN 下的 XHTTP 继续走 Nginx 反代链路，并由 Nginx 负责基于路径的分流; 2. 增加适配 Clash Mihomo 的 XHTTP 客户端输出，在固定隧道下覆盖 HTTP/1.1 CDN 与 HTTP/3 Direct
@@ -105,7 +107,7 @@
 * **安装时可按需多选协议**，支持 11 种协议：VLESS + Reality Vision、Hysteria2、VLESS + Reality gRPC、VLESS + WS、VMess + WS、Trojan + WS、Shadowsocks + WS、VLESS + XHTTP、VLESS + XHTTP Direct、Trojan Direct、Shadowsocks 2022 Direct；安装后支持随时增删协议（`argox -r`）；
 * Hysteria2、VLESS + XHTTP Direct、Trojan Direct 使用自签证书直连；更换 TLS 域名时会自动同步重新生成自签证书；
 * Nginx 作为 WS/XHTTP 协议的统一对外分流入口，Reality、Hysteria2、Trojan Direct、Shadowsocks 2022 Direct 与 XHTTP Direct 可按各自模式直连，架构简洁；
-* 内置 warp 链式代理解锁 chatGPT；
+* 内置 warp 链式代理解锁 chatGPT；选择任一协议时会同时生成 **原生出口** 与 **套 WARP 出口** 两个节点（节点名带 `-warp` 后缀）；
 * 节点信息输出到 V2rayN / Clash Meta / 小火箭 / Throne / Sing-box (SFI, SFA, SFM)，订阅自动适配客户端，一个订阅 url 走天下；
 * 极速安装，即可交互式安装，也可像 docker compose 一样的非交互式安装，提前把所有的参数放到一个配置文件，全程不到 5 秒。
 
@@ -216,7 +218,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh)
 ├── inbound.json              # 按已选协议动态生成的入站配置文件
 ├── list                      # 节点信息列表
 ├── nginx.conf                # Nginx 配置文件（安装 WS/XHTTP 协议或启用订阅功能时生成）
-├── outbound.json             # 出站和路由配置文件，chatGPT 使用 warp ipv6 链式代理出站
+├── outbound.json             # 出站和路由：*-warp 入站走 WARP，其余 direct；OpenAI 域名规则优先
 ├── xray                      # xray 主程序
 ├── ax.sh                     # 快捷方式脚本文件
 ├── jq                        # 命令行 JSON 处理器

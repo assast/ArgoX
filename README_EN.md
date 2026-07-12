@@ -21,6 +21,8 @@
 * * *
 
 ## Update Information
+2026.07.13 v2.0.8 Each selected protocol now generates 2 nodes: native exit IP + WARP exit IP (server-side inboundTag routing)
+
 2026.06.04 v2.0.7 1. Replace Nekobox with Throne for client output; 2. Independent v2rayN configuration output; 3. Security upgrade: remove insecure=true, use TLS certificate fingerprint verification
 
 2026.04.21 v2.0.6 1. Keep XHTTP over CDN on the Nginx reverse-proxy path and let Nginx handle path-based routing; 2. Add Clash Mihomo-compatible XHTTP client output for fixed tunnels in HTTP/1.1 CDN and HTTP/3 direct modes
@@ -106,7 +108,7 @@
 * **Select protocols on demand during installation**, supporting 11 protocols: VLESS + Reality Vision, Hysteria2, VLESS + Reality gRPC, VLESS + WS, VMess + WS, Trojan + WS, Shadowsocks + WS, VLESS + XHTTP, VLESS + XHTTP Direct, Trojan Direct, Shadowsocks 2022 Direct; add or remove protocols at any time after installation (`argox -r`);
 * Hysteria2, VLESS + XHTTP Direct, and Trojan Direct use self-signed certificates for direct connections; the self-signed certificate is regenerated automatically when the TLS domain changes;
 * Nginx serves as the unified external dispatcher for WS/XHTTP protocols; Reality, Hysteria2, Trojan Direct, Shadowsocks 2022 Direct, and XHTTP Direct can use their respective direct modes — clean and simple architecture;
-* Built-in warp chained proxy to unlock chatGPT;
+* Built-in warp chained proxy to unlock chatGPT; each selected protocol generates **native-exit** and **WARP-exit** nodes (name suffix `-warp`);
 * Node information output to V2rayN / Clash Meta / Shadowrocket / Throne / Sing-box (SFI, SFA, SFM), subscription automatically adapts to clients, one subscription URL for everything;
 * Ultra-fast installation, either interactive or non-interactive like docker compose. Put all parameters in a configuration file in advance, taking less than 5 seconds.
 
@@ -213,7 +215,7 @@ Detailed tutorial: [Synology Suite: Chinese Tutorial for Cloudflare Tunnel Penet
 ├── inbound.json              # Dynamically generated inbound config based on selected protocols
 ├── list                      # Node information list
 ├── nginx.conf                # Nginx configuration file (generated when WS/XHTTP protocols are installed or subscription is enabled)
-├── outbound.json             # Outbound and routing config, chatGPT uses warp ipv6 chained proxy outbound
+├── outbound.json             # Outbound/routing: *-warp inbounds via WARP, others direct; OpenAI domain rules first
 ├── xray                      # xray main program
 ├── ax.sh                     # Shortcut script file
 ├── jq                        # Command-line JSON processor
