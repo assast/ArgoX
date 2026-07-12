@@ -141,12 +141,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh)
 
 ### 中文
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) -l
+bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh) -l
 ```
 
 ### 英文
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) -k
+bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh) -k
 ```
 
 
