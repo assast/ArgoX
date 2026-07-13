@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.10 (2026.07.14)'
+VERSION='2.0.11 (2026.07.14)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -59,8 +59,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="v2.0.10: Menu/CLI to re-register free WARP account and refresh exit IP"
-C[1]="v2.0.10: 菜单/命令行支持重新注册 free WARP 账号并刷新出口 IP"
+E[1]="v2.0.11: Split WARP actions: change endpoint vs re-register account"
+C[1]="v2.0.11: WARP 拆为两项：更换 Endpoint / 重新注册账号"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -313,14 +313,26 @@ E[126]="WARP free registration failed; fell back to shared account (may be unsta
 C[126]="WARP 免费账号注册失败，已回退公共账号（可能不稳定）。"
 E[127]="WARP credentials ready (independent free account)."
 C[127]="WARP 凭证已就绪（独立 free 账号）。"
-E[128]="Re-register WARP free account / refresh exit IP (argox -w)"
-C[128]="重新注册 WARP 免费账号 / 刷新出口 IP (argox -w)"
+E[128]="Change WARP endpoint (argox -p)"
+C[128]="更换 WARP Endpoint (argox -p)"
 E[129]="This will register a new free WARP account and rewrite outbound. Exit IP may change. Continue? [y/N]:"
 C[129]="将重新注册 free WARP 账号并重写 outbound，出口 IP 可能变化。继续？ [y/N]:"
 E[130]="WARP account re-registered: \${_kind}. Restarting Xray to apply."
 C[130]="WARP 账号已重新注册：\${_kind}。正在重启 Xray 使配置生效。"
 E[131]="WARP re-registration aborted."
 C[131]="已取消重新注册 WARP。"
+E[132]="Re-register WARP free account (argox -w)"
+C[132]="重新注册 WARP 免费账号 (argox -w)"
+E[133]="Current WARP endpoint: \${_cur}"
+C[133]="当前 WARP Endpoint: \${_cur}"
+E[134]="Select a candidate or enter host:port (press Enter to keep current):"
+C[134]="选择候选或输入 host:port（回车保持当前）:"
+E[135]="Invalid endpoint. Use host:port or [IPv6]:port."
+C[135]="Endpoint 格式无效，请使用 host:port 或 [IPv6]:port。"
+E[136]="WARP endpoint updated: \${_old} -> \${_new}. Restarting Xray to apply."
+C[136]="WARP Endpoint 已更新：\${_old} -> \${_new}。正在重启 Xray 使配置生效。"
+E[137]="WARP endpoint unchanged."
+C[137]="WARP Endpoint 未变更。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -765,7 +777,80 @@ ensure_warp_credentials() {
   return 0
 }
 
-# 重新注册 free WARP 账号并重写 outbound（用于刷新出口 IP）
+# 校验 WARP endpoint：host:port 或 [IPv6]:port
+is_valid_warp_endpoint() {
+  local _ep="$1"
+  [[ "$_ep" =~ ^\[[0-9a-fA-F:]+\]:[0-9]{1,5}$ ]] && return 0
+  [[ "$_ep" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] && return 0
+  return 1
+}
+
+# 读取当前 WARP endpoint（custom > outbound > 默认探测）
+get_current_warp_endpoint() {
+  local _jq _ep
+  if [ -n "${WARP_ENDPOINT:-}" ]; then
+    printf '%s' "$WARP_ENDPOINT"
+    return
+  fi
+  if [ -s "$CUSTOM_FILE" ]; then
+    _ep=$(awk -F= '/^warpEndpoint=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    [ -n "$_ep" ] && { printf '%s' "$_ep"; return; }
+  fi
+  if [ -s "$WORK_DIR/outbound.json" ]; then
+    _jq=$(_jq_bin 2>/dev/null) || true
+    if [ -n "$_jq" ] && [ -x "$_jq" ]; then
+      _ep=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.peers[0].endpoint // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+      [ -n "$_ep" ] && [ "$_ep" != "null" ] && { printf '%s' "$_ep"; return; }
+    fi
+  fi
+  pick_warp_endpoint
+}
+
+# 更换 WARP Endpoint（不换账号；有时会换出口 PoP，不保证）
+change_warp_endpoint() {
+  local _jq _cur _input _new _old _i
+
+  [ ! -d "$WORK_DIR" ] && error " $(text 39) "
+  [ ! -s "$WORK_DIR/inbound.json" ] && error " $(text 39) "
+  _jq=$(_jq_bin) || error " $(text 39) "
+
+  _cur=$(get_current_warp_endpoint)
+  _old="$_cur"
+  hint "\n $(text 133) \n"
+  for _i in "${!WARP_ENDPOINT_CANDIDATES[@]}"; do
+    hint " $((_i + 1)). ${WARP_ENDPOINT_CANDIDATES[_i]} "
+  done
+  reading "\n $(text 134) " _input
+  [ -z "$_input" ] && info " $(text 137) " && return 0
+
+  if [[ "$_input" =~ ^[1-9][0-9]*$ ]] && [ "$_input" -le "${#WARP_ENDPOINT_CANDIDATES[@]}" ]; then
+    _new="${WARP_ENDPOINT_CANDIDATES[$((_input - 1))]}"
+  else
+    _new="$_input"
+  fi
+  is_valid_warp_endpoint "$_new" || error " $(text 135) "
+  if [ "$_new" = "$_old" ]; then
+    info " $(text 137) "
+    return 0
+  fi
+
+  WARP_ENDPOINT="$_new"
+  write_custom 'warpEndpoint' "$_new"
+  # 复用已有账号凭证，只改 endpoint 后重写 outbound
+  unset WARP_SECRET_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED
+  write_outbound_json || error " $(text 38) "
+
+  info " $(text 136) "
+  cmd_systemctl restart xray
+  sleep 2
+  if cmd_systemctl status xray &>/dev/null; then
+    info "\n Xray $(text 28) $(text 37) \n"
+  else
+    warning "\n Xray $(text 27) $(text 38) \n"
+  fi
+}
+
+# 重新注册 free WARP 账号并重写 outbound（换身份，更有机会换出口 IP）
 # 用法: renew_warp_account [force]
 #   force: 跳过确认（CLI 非交互场景可传）
 renew_warp_account() {
@@ -4865,11 +4950,12 @@ menu_setting() {
     OPTION[5]="5 .  $(text 76)"
     OPTION[6]="6 .  $(text 95)"
     OPTION[7]="7 .  $(text 128)"
-    OPTION[8]="8 .  $(text 31)"
-    OPTION[9]="9 .  $(text 32)"
-    OPTION[10]="10.  $(text 33)"
-    OPTION[11]="11.  $(text 51)"
-    OPTION[12]="12.  $(text 57)"
+    OPTION[8]="8 .  $(text 132)"
+    OPTION[9]="9 .  $(text 31)"
+    OPTION[10]="10.  $(text 32)"
+    OPTION[11]="11.  $(text 33)"
+    OPTION[12]="12.  $(text 51)"
+    OPTION[13]="13.  $(text 57)"
 
     ACTION[1]() { export_list; exit 0; }
     [[ ${STATUS[0]} = "$(text 28)" ]] &&
@@ -4897,12 +4983,13 @@ menu_setting() {
     ACTION[4]() { change_argo; exit; }
     ACTION[5]() { change_config; exit; }
     ACTION[6]() { change_protocols; exit; }
-    ACTION[7]() { renew_warp_account; exit; }
-    ACTION[8]() { version; exit; }
-    ACTION[9]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh); exit; }
-    ACTION[10]() { uninstall; exit; }
-    ACTION[11]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh) -$L; exit; }
-    ACTION[12]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sba/main/sba.sh) -$L; exit; }
+    ACTION[7]() { change_warp_endpoint; exit; }
+    ACTION[8]() { renew_warp_account; exit; }
+    ACTION[9]() { version; exit; }
+    ACTION[10]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh); exit; }
+    ACTION[11]() { uninstall; exit; }
+    ACTION[12]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh) -$L; exit; }
+    ACTION[13]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sba/main/sba.sh) -$L; exit; }
 
   else
     OPTION[1]="1.  $(text 77)"
@@ -5070,7 +5157,7 @@ unset _NEED_RESTART_XRAY _NEED_RELOAD_NGINX
 [[ "${*,,}" =~ '-e'|'-k' ]] && L=E
 [[ "${*,,}" =~ '-c'|'-b'|'-l' ]] && L=C
 
-while getopts ":AaXxTtDdUuNnVvBbRrWwF:f:KkLl" OPTNAME; do
+while getopts ":AaXxTtDdUuNnVvBbRrWwPpF:f:KkLl" OPTNAME; do
   case "${OPTNAME,,}" in
     a ) select_language; check_system_info; check_install
         [ "${STATUS[0]}" = "$(text 28)" ] && {
@@ -5099,6 +5186,7 @@ while getopts ":AaXxTtDdUuNnVvBbRrWwF:f:KkLl" OPTNAME; do
     t ) select_language; check_system_info; check_arch; change_argo; exit 0 ;;
     d ) select_language; check_system_info; change_config; exit 0 ;;
     r ) select_language; check_system_info; check_install; change_protocols; exit 0 ;;
+    p ) select_language; check_system_info; check_install; change_warp_endpoint; exit 0 ;;
     w ) select_language; check_system_info; check_install; renew_warp_account; exit 0 ;;
     u ) select_language; check_system_info; uninstall; exit 0;;
     n ) select_language; check_system_info; export_list; exit 0 ;;

@@ -20,6 +20,8 @@
 
 * * *
 ## 更新信息
+2026.07.14 v2.0.11 WARP 操作拆分：`argox -p` 更换 Endpoint（轻）；`argox -w` 重新注册账号（重）
+
 2026.07.14 v2.0.10 菜单 / `argox -w` 支持重新注册 free WARP 账号并刷新出口 IP；修复 `WARP_FORCE_REREG=1` 对已有独立账号不生效的问题
 
 2026.07.13 v2.0.9 每台 VPS 自动注册独立 free WARP 账号；endpoint 优先使用 IP；MTU 默认 1200 改善 CDN+WARP 双跳稳定性；已安装环境自动从公共账号迁移
@@ -111,7 +113,7 @@
 * **安装时可按需多选协议**，支持 11 种协议：VLESS + Reality Vision、Hysteria2、VLESS + Reality gRPC、VLESS + WS、VMess + WS、Trojan + WS、Shadowsocks + WS、VLESS + XHTTP、VLESS + XHTTP Direct、Trojan Direct、Shadowsocks 2022 Direct；安装后支持随时增删协议（`argox -r`）；
 * Hysteria2、VLESS + XHTTP Direct、Trojan Direct 使用自签证书直连；更换 TLS 域名时会自动同步重新生成自签证书；
 * Nginx 作为 WS/XHTTP 协议的统一对外分流入口，Reality、Hysteria2、Trojan Direct、Shadowsocks 2022 Direct 与 XHTTP Direct 可按各自模式直连，架构简洁；
-* 内置 warp 链式代理解锁 chatGPT；选择任一协议时会同时生成 **原生出口** 与 **套 WARP 出口** 两个节点（节点名带 `-warp` 后缀）；安装时自动注册独立 free WARP 账号并持久化，重启后出口 IP 通常不变；需要换出口时用菜单或 `argox -w` 重新注册；
+* 内置 warp 链式代理解锁 chatGPT；选择任一协议时会同时生成 **原生出口** 与 **套 WARP 出口** 两个节点（节点名带 `-warp` 后缀）；安装时自动注册独立 free WARP 账号并持久化，重启后出口 IP 通常不变；需要尝试换出口时可用 `argox -p` 换 Endpoint（轻）或 `argox -w` 重新注册账号（重）；
 * 节点信息输出到 V2rayN / Clash Meta / 小火箭 / Throne / Sing-box (SFI, SFA, SFM)，订阅自动适配客户端，一个订阅 url 走天下；
 * 极速安装，即可交互式安装，也可像 docker compose 一样的非交互式安装，提前把所有的参数放到一个配置文件，全程不到 5 秒。
 
@@ -133,7 +135,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh)
   | -t / -T | 更换 Argo 隧道 |
   | -d / -D | 更换优选域名 / SNI / 节点信息 |
   | -r / -R | 增加 / 删除协议 |
-  | -w / -W | 重新注册 WARP 账号 / 刷新出口 IP |
+  | -p / -P | 更换 WARP Endpoint（轻，不换账号） |
+  | -w / -W | 重新注册 WARP 账号（重，更可能换出口） |
   | -u / -U | 卸载 |
   | -v / -V | 同步最新版本 |
   | -b / -B | 升级内核 / BBR / DD |

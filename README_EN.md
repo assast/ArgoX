@@ -21,6 +21,8 @@
 * * *
 
 ## Update Information
+2026.07.14 v2.0.11 Split WARP actions: `argox -p` change endpoint (light); `argox -w` re-register account (heavy)
+
 2026.07.14 v2.0.10 Menu / `argox -w` can re-register a free WARP account and refresh exit IP; fix `WARP_FORCE_REREG=1` not applying to existing independent accounts
 
 2026.07.13 v2.0.9 Auto-register an independent free WARP account per VPS; prefer IP endpoints; default MTU 1200 for CDN+WARP dual-hop stability; migrate installed shared accounts automatically
@@ -112,7 +114,7 @@
 * **Select protocols on demand during installation**, supporting 11 protocols: VLESS + Reality Vision, Hysteria2, VLESS + Reality gRPC, VLESS + WS, VMess + WS, Trojan + WS, Shadowsocks + WS, VLESS + XHTTP, VLESS + XHTTP Direct, Trojan Direct, Shadowsocks 2022 Direct; add or remove protocols at any time after installation (`argox -r`);
 * Hysteria2, VLESS + XHTTP Direct, and Trojan Direct use self-signed certificates for direct connections; the self-signed certificate is regenerated automatically when the TLS domain changes;
 * Nginx serves as the unified external dispatcher for WS/XHTTP protocols; Reality, Hysteria2, Trojan Direct, Shadowsocks 2022 Direct, and XHTTP Direct can use their respective direct modes — clean and simple architecture;
-* Built-in warp chained proxy to unlock chatGPT; each selected protocol generates **native-exit** and **WARP-exit** nodes (name suffix `-warp`); installs with an independent free WARP account that is persisted, so reboot usually keeps the same exit IP; use the menu or `argox -w` to re-register when you need a new exit;
+* Built-in warp chained proxy to unlock chatGPT; each selected protocol generates **native-exit** and **WARP-exit** nodes (name suffix `-warp`); installs with an independent free WARP account that is persisted, so reboot usually keeps the same exit IP; try `argox -p` to change endpoint (light) or `argox -w` to re-register the account (heavy) when you need a different exit;
 * Node information output to V2rayN / Clash Meta / Shadowrocket / Throne / Sing-box (SFI, SFA, SFM), subscription automatically adapts to clients, one subscription URL for everything;
 * Ultra-fast installation, either interactive or non-interactive like docker compose. Put all parameters in a configuration file in advance, taking less than 5 seconds.
 
@@ -134,7 +136,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh)
   | -t / -T | Change Argo tunnel |
   | -d / -D | Change preferred CDN / SNI / node info |
   | -r / -R | Add / Remove protocols |
-  | -w / -W | Re-register WARP account / refresh exit IP |
+  | -p / -P | Change WARP endpoint (light, keep account) |
+  | -w / -W | Re-register WARP account (heavy, more likely new exit) |
   | -u / -U | Uninstall |
   | -v / -V | Sync to latest version |
   | -b / -B | Upgrade kernel / BBR / DD |
