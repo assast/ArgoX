@@ -573,7 +573,8 @@ write_outbound_json() {
                 "domainStrategy": "UseIPv4"
             },
             "proxySettings": {
-                "tag": "wireguard"
+                "tag": "wireguard",
+                "transportLayer": true
             }
         },
         {
@@ -583,7 +584,8 @@ write_outbound_json() {
                 "domainStrategy": "UseIPv6"
             },
             "proxySettings": {
-                "tag": "wireguard"
+                "tag": "wireguard",
+                "transportLayer": true
             }
         }
     ],
@@ -1514,40 +1516,64 @@ fetch_nodes_value() {
 # 获取 Argo 隧道域名，通过传参选择获取方式：
 #   quick  - 临时隧道，查询 cloudflared metrics /quicktunnel 端点
 #   config - Json/Token 隧道，查询 /config 端点，同时解析出 NGINX_PORT
+# 成功解析到域名时写入 custom；失败时保留已有 ARGO_DOMAIN（避免 Token 安装后被清空）
 fetch_tunnel_domain() {
   local _MODE="${1:-quick}"
-  local _CF_PID _METRICS_ADDR
+  local _CF_PID _METRICS_ADDR _SAVED_DOMAIN="$ARGO_DOMAIN" _FOUND_DOMAIN=''
   _CF_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/cloudflared"){print $1;exit}')
   [[ "$_CF_PID" =~ ^[0-9]+$ ]] && _METRICS_ADDR=$(ss -nltp | awk -v pid="$_CF_PID" '$0 ~ "pid="pid"," {print $4; exit}' | sed 's/^\*/127.0.0.1/; s/^0\.0\.0\.0/127.0.0.1/')
 
   if [ "$_MODE" = 'config' ]; then
-    unset ARGO_DOMAIN
-    [ -z "$_METRICS_ADDR" ] && return 1
+    [ -z "$_METRICS_ADDR" ] && { [ -n "$_SAVED_DOMAIN" ] && ARGO_DOMAIN="$_SAVED_DOMAIN"; return 1; }
     local _CONFIG_JSON
     _CONFIG_JSON=$(wget -qO- "http://${_METRICS_ADDR}/config" 2>/dev/null)
-    [ -z "$_CONFIG_JSON" ] && return 1
+    if [ -z "$_CONFIG_JSON" ]; then
+      [ -n "$_SAVED_DOMAIN" ] && ARGO_DOMAIN="$_SAVED_DOMAIN"
+      return 1
+    fi
     [ -z "$NGINX_PORT" ] && [ -s "$WORK_DIR/nginx.conf" ] && NGINX_PORT=$(awk '/listen[[:space:]]/{gsub(/;/,""); print $2; exit}' "$WORK_DIR/nginx.conf")
-    ARGO_DOMAIN=$($WORK_DIR/jq -r --arg port "$NGINX_PORT" '.config.ingress[] | select(.service == ("http://localhost:" + $port)) | .hostname ' <<< "$_CONFIG_JSON")
-    return 0
+    # 优先匹配 nginx 端口；Token 隧道 dashboard 可能写成 127.0.0.1 / localhost，再回退取首个有效 hostname
+    if [ -x "$WORK_DIR/jq" ]; then
+      _FOUND_DOMAIN=$($WORK_DIR/jq -r --arg port "${NGINX_PORT:-}" '
+        (.config.ingress // []) as $ing
+        | first(
+            ($ing[] | select(($port | length) > 0 and ((.service // "") | test("^(https?://)?(localhost|127\\.0\\.0\\.1):" + $port + "/?$"))) | .hostname // empty),
+            ($ing[] | select((.hostname // "") != "" and (.hostname // "") != "*") | .hostname)
+          ) // empty
+        ' <<< "$_CONFIG_JSON" 2>/dev/null | head -1)
+    fi
+    if [ -n "$_FOUND_DOMAIN" ] && [ "$_FOUND_DOMAIN" != 'null' ]; then
+      ARGO_DOMAIN="$_FOUND_DOMAIN"
+      write_custom 'argoDomain' "$ARGO_DOMAIN"
+      return 0
+    fi
+    [ -n "$_SAVED_DOMAIN" ] && ARGO_DOMAIN="$_SAVED_DOMAIN"
+    return 1
   else
-    unset ARGO_DOMAIN
     local _ERROR_TIME=20
-    until [ -n "$ARGO_DOMAIN" ]; do
+    until [ -n "$_FOUND_DOMAIN" ]; do
       if [ -z "$_METRICS_ADDR" ]; then
         _CF_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/cloudflared"){print $1;exit}')
         [[ "$_CF_PID" =~ ^[0-9]+$ ]] && \
           _METRICS_ADDR=$(ss -nltp | awk -v pid="$_CF_PID" '$0 ~ "pid="pid"," {print $4; exit}' \
             | sed 's/^\*/127.0.0.1/; s/^0\.0\.0\.0/127.0.0.1/')
       fi
-      [ -n "$_METRICS_ADDR" ] && ARGO_DOMAIN=$(wget -qO- "http://${_METRICS_ADDR}/quicktunnel" | awk -F '"' '{print $4}')
-      if [[ ! "$ARGO_DOMAIN" =~ trycloudflare\.com$ ]]; then
+      [ -n "$_METRICS_ADDR" ] && _FOUND_DOMAIN=$(wget -qO- "http://${_METRICS_ADDR}/quicktunnel" | awk -F '"' '{print $4}')
+      if [[ ! "$_FOUND_DOMAIN" =~ trycloudflare\.com$ ]]; then
+        unset _FOUND_DOMAIN
         (( _ERROR_TIME-- )) || true
-        [ "$_ERROR_TIME" = 0 ] && warning "\n $(text 102) \n" && unset ARGO_DOMAIN && return 1
+        if [ "$_ERROR_TIME" = 0 ]; then
+          warning "\n $(text 102) \n"
+          [ -n "$_SAVED_DOMAIN" ] && ARGO_DOMAIN="$_SAVED_DOMAIN"
+          return 1
+        fi
         sleep 2
       else
         break
       fi
     done
+    ARGO_DOMAIN="$_FOUND_DOMAIN"
+    write_custom 'argoDomain' "$ARGO_DOMAIN"
   fi
 }
 
@@ -2532,6 +2558,7 @@ install_argox() {
   write_custom 'publicKey' "${REALITY_PUBLIC:-__KEY_UNSET__}"
   write_custom 'cdn' "${SERVER:-__CDN_UNSET__}"
   write_custom 'cdnPort' "${SERVER_PORT:-443}"
+  [ -n "$ARGO_DOMAIN" ] && write_custom 'argoDomain' "$ARGO_DOMAIN"
   [ -s "$VARIABLE_FILE" ] && cp $VARIABLE_FILE $WORK_DIR/
 
   wait
@@ -3244,13 +3271,17 @@ export_list() {
     fi
   fi
 
+  # Token 模式不会写 tunnel.yml，优先从 custom 恢复安装时保存的域名，再尝试 metrics / 已有 list
+  [ -z "$ARGO_DOMAIN" ] && [ -s "$CUSTOM_FILE" ] && ARGO_DOMAIN=$(awk -F= '/^argoDomain=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
   if grep -qs "^${DAEMON_RUN_PATTERN}.*--url" ${ARGO_DAEMON_FILE}; then
     fetch_tunnel_domain quick || true
   else
     fetch_tunnel_domain config >/dev/null 2>&1 || true
     [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ] && ARGO_DOMAIN=$(awk '/^[[:space:]]*-[[:space:]]*hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml" 2>/dev/null)
+    [ -z "$ARGO_DOMAIN" ] && [ -s "$CUSTOM_FILE" ] && ARGO_DOMAIN=$(awk -F= '/^argoDomain=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
     [ -z "$ARGO_DOMAIN" ] && ARGO_DOMAIN=$(grep -m1 '^vless.*host=.*' $WORK_DIR/list 2>/dev/null | sed "s@.*host=\(.*\)&.*@\1@g")
   fi
+  [ -n "$ARGO_DOMAIN" ] && write_custom 'argoDomain' "$ARGO_DOMAIN"
   fetch_nodes_value
 
   local _SUB_SCHEME='https'
@@ -4127,6 +4158,7 @@ change_argo() {
           sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --config $WORK_DIR/tunnel.yml run@g" ${ARGO_DAEMON_FILE}
         fi
       fi
+      [ -n "$ARGO_DOMAIN" ] && write_custom 'argoDomain' "$ARGO_DOMAIN"
       ;;
     * )
       exit 0
@@ -4583,6 +4615,31 @@ if [ -s $WORK_DIR/nginx.conf ] && grep -q 'v2rayN|Neko|Throne' $WORK_DIR/nginx.c
   [ -s $WORK_DIR/subscribe/base64 ] && rm -f $WORK_DIR/subscribe/base64
   cmd_systemctl restart xray
   export_list >/dev/null 2>&1
+fi
+
+# 已安装环境：补齐 WARP 链式所需的 transportLayer（旧配置缺此项会导致 WireGuard 链式不通）
+# 放在 getopts 之前，保证 argox -n / 菜单等入口都会执行
+if [ -s "$WORK_DIR/outbound.json" ] && ! grep -q '"transportLayer"' "$WORK_DIR/outbound.json" 2>/dev/null; then
+  if [ -x "$WORK_DIR/jq" ]; then
+    _OUT_TMP=$(mktemp 2>/dev/null || echo "$TEMP_DIR/outbound.fix")
+    if "$WORK_DIR/jq" '
+      .outbounds |= map(
+        if (.tag == "warp-IPv4" or .tag == "warp-IPv6") and (.proxySettings.tag? == "wireguard")
+        then .proxySettings.transportLayer = true
+        else . end
+      )
+    ' "$WORK_DIR/outbound.json" > "$_OUT_TMP" 2>/dev/null && [ -s "$_OUT_TMP" ]; then
+      mv "$_OUT_TMP" "$WORK_DIR/outbound.json"
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet xray 2>/dev/null; then
+        systemctl restart xray >/dev/null 2>&1 || true
+      elif [ -x /etc/init.d/xray ]; then
+        /etc/init.d/xray restart >/dev/null 2>&1 || true
+      fi
+    else
+      rm -f "$_OUT_TMP" 2>/dev/null
+    fi
+    unset _OUT_TMP
+  fi
 fi
 
 # 传参
