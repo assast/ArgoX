@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.9 (2026.07.13)'
+VERSION='2.0.10 (2026.07.14)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -59,8 +59,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="v2.0.9: Auto-register independent free WARP account per VPS; prefer endpoint IP; lower MTU for dual-hop stability"
-C[1]="v2.0.9: 每台 VPS 自动注册独立 free WARP 账号；endpoint 优先用 IP；降低 MTU 改善双跳稳定性"
+E[1]="v2.0.10: Menu/CLI to re-register free WARP account and refresh exit IP"
+C[1]="v2.0.10: 菜单/命令行支持重新注册 free WARP 账号并刷新出口 IP"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -313,6 +313,14 @@ E[126]="WARP free registration failed; fell back to shared account (may be unsta
 C[126]="WARP 免费账号注册失败，已回退公共账号（可能不稳定）。"
 E[127]="WARP credentials ready (independent free account)."
 C[127]="WARP 凭证已就绪（独立 free 账号）。"
+E[128]="Re-register WARP free account / refresh exit IP (argox -w)"
+C[128]="重新注册 WARP 免费账号 / 刷新出口 IP (argox -w)"
+E[129]="This will register a new free WARP account and rewrite outbound. Exit IP may change. Continue? [y/N]:"
+C[129]="将重新注册 free WARP 账号并重写 outbound，出口 IP 可能变化。继续？ [y/N]:"
+E[130]="WARP account re-registered: \${_kind}. Restarting Xray to apply."
+C[130]="WARP 账号已重新注册：\${_kind}。正在重启 Xray 使配置生效。"
+E[131]="WARP re-registration aborted."
+C[131]="已取消重新注册 WARP。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -640,12 +648,15 @@ save_warp_credentials() {
 }
 
 # 从 custom / 现有 outbound 加载；必要时注册独立账号；失败回退公共账号
-# 设 WARP_FORCE_REREG=1 可强制重新注册
+# 设 WARP_FORCE_REREG=1 可强制重新注册（跳过已有凭证缓存）
 ensure_warp_credentials() {
-  local _jq _sk _v4 _v6 _rsv _ep _mtu _acct
+  local _jq _sk _v4 _v6 _rsv _ep _mtu _acct _force_rereg
 
-  # 1) 环境变量 / config.conf 已注入（非空）
-  if [ -n "${WARP_SECRET_KEY:-}" ] && [ -n "${WARP_RESERVED:-}" ]; then
+  _force_rereg=false
+  [ "${WARP_FORCE_REREG:-0}" = "1" ] && _force_rereg=true
+
+  # 1) 环境变量 / config.conf 已注入（非空）；强制重注册时忽略
+  if ! $_force_rereg && [ -n "${WARP_SECRET_KEY:-}" ] && [ -n "${WARP_RESERVED:-}" ]; then
     WARP_ADDR_V4=${WARP_ADDR_V4:-$WARP_SHARED_ADDR_V4}
     WARP_ADDR_V6=${WARP_ADDR_V6:-$WARP_SHARED_ADDR_V6}
     WARP_ENDPOINT=${WARP_ENDPOINT:-$(pick_warp_endpoint)}
@@ -653,8 +664,8 @@ ensure_warp_credentials() {
     return 0
   fi
 
-  # 2) custom 持久化
-  if [ -s "$CUSTOM_FILE" ]; then
+  # 2) custom 持久化（强制重注册时跳过，走重新注册）
+  if ! $_force_rereg && [ -s "$CUSTOM_FILE" ]; then
     _sk=$(awk -F= '/^warpSecretKey=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
     _v4=$(awk -F= '/^warpAddrV4=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
     _v6=$(awk -F= '/^warpAddrV6=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
@@ -671,8 +682,8 @@ ensure_warp_credentials() {
       WARP_MTU=${WARP_MTU:-${_mtu:-$WARP_MTU_DEFAULT}}
       return 0
     fi
-    # 已标记 shared 且未强制重注册 → 直接用公共账号，避免每次菜单打 API
-    if [ "${WARP_FORCE_REREG:-0}" != "1" ] && [ "$_acct" = "shared" ]; then
+    # 已标记 shared → 直接用公共账号，避免每次菜单打 API
+    if [ "$_acct" = "shared" ]; then
       WARP_SECRET_KEY="$WARP_SHARED_SECRET_KEY"
       WARP_ADDR_V4=${_v4:-$WARP_SHARED_ADDR_V4}
       WARP_ADDR_V6=${_v6:-$WARP_SHARED_ADDR_V6}
@@ -683,8 +694,8 @@ ensure_warp_credentials() {
     fi
   fi
 
-  # 3) 现有 outbound.json 中的非公共账号
-  if [ -s "$WORK_DIR/outbound.json" ]; then
+  # 3) 现有 outbound.json 中的非公共账号（强制重注册时跳过）
+  if ! $_force_rereg && [ -s "$WORK_DIR/outbound.json" ]; then
     _jq=$(_jq_bin 2>/dev/null) || true
     if [ -n "$_jq" ] && [ -x "$_jq" ]; then
       _sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
@@ -705,6 +716,18 @@ ensure_warp_credentials() {
           return 0
         fi
       fi
+    fi
+  fi
+
+  # 强制重注册时清空内存中的旧凭证，避免回落到旧值
+  if $_force_rereg; then
+    unset WARP_SECRET_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED
+    # endpoint / mtu 若用户在 custom 中自定义则保留
+    if [ -s "$CUSTOM_FILE" ]; then
+      _ep=$(awk -F= '/^warpEndpoint=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+      _mtu=$(awk -F= '/^warpMtu=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+      [ -n "$_ep" ] && WARP_ENDPOINT="$_ep"
+      [ -n "$_mtu" ] && WARP_MTU="$_mtu"
     fi
   fi
 
@@ -740,6 +763,58 @@ ensure_warp_credentials() {
     warning " WARP free registration failed; fell back to shared account. / 注册失败，已回退公共账号。 "
   fi
   return 0
+}
+
+# 重新注册 free WARP 账号并重写 outbound（用于刷新出口 IP）
+# 用法: renew_warp_account [force]
+#   force: 跳过确认（CLI 非交互场景可传）
+renew_warp_account() {
+  local _force="${1:-}" _confirm _kind _old_sk _new_sk _jq
+
+  [ ! -d "$WORK_DIR" ] && error " $(text 39) "
+  [ ! -s "$WORK_DIR/inbound.json" ] && error " $(text 39) "
+  _jq=$(_jq_bin) || error " $(text 39) "
+
+  if [ "$_force" != "force" ]; then
+    reading " $(text 129) " _confirm
+    [[ ! "${_confirm,,}" =~ ^y(es)?$ ]] && info " $(text 131) " && return 0
+  fi
+
+  # 记录旧 secretKey，便于判断是否真正换号
+  _old_sk=''
+  if [ -s "$WORK_DIR/outbound.json" ]; then
+    _old_sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+  fi
+  [ -z "$_old_sk" ] && [ -s "$CUSTOM_FILE" ] && \
+    _old_sk=$(awk -F= '/^warpSecretKey=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+
+  # 清掉 custom 中的旧凭证；保留 endpoint / mtu 自定义
+  if [ -s "$CUSTOM_FILE" ]; then
+    sed -i '/^warpSecretKey=/d;/^warpAddrV4=/d;/^warpAddrV6=/d;/^warpReserved=/d;/^warpAccount=/d' "$CUSTOM_FILE" 2>/dev/null || true
+  fi
+  unset WARP_SECRET_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED
+  WARP_FORCE_REREG=1
+
+  write_outbound_json || error " $(text 38) "
+  unset WARP_FORCE_REREG
+
+  _new_sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+  _kind=$(awk -F= '/^warpAccount=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+  _kind=${_kind:-unknown}
+  if [ -n "$_new_sk" ] && [ "$_new_sk" = "$WARP_SHARED_SECRET_KEY" ]; then
+    _kind='shared'
+  elif [ -n "$_new_sk" ] && [ "$_new_sk" != "$_old_sk" ]; then
+    _kind='independent'
+  fi
+
+  info " $(text 130) "
+  cmd_systemctl restart xray
+  sleep 2
+  if cmd_systemctl status xray &>/dev/null; then
+    info "\n Xray $(text 28) $(text 37) \n"
+  else
+    warning "\n Xray $(text 27) $(text 38) \n"
+  fi
 }
 
 # 根据当前 inbound.json 重写 outbound.json（独立 WARP + inboundTag 分流）
@@ -4789,11 +4864,12 @@ menu_setting() {
     OPTION[4]="4 .  $(text 30)"
     OPTION[5]="5 .  $(text 76)"
     OPTION[6]="6 .  $(text 95)"
-    OPTION[7]="7 .  $(text 31)"
-    OPTION[8]="8 .  $(text 32)"
-    OPTION[9]="9 .  $(text 33)"
-    OPTION[10]="10.  $(text 51)"
-    OPTION[11]="11.  $(text 57)"
+    OPTION[7]="7 .  $(text 128)"
+    OPTION[8]="8 .  $(text 31)"
+    OPTION[9]="9 .  $(text 32)"
+    OPTION[10]="10.  $(text 33)"
+    OPTION[11]="11.  $(text 51)"
+    OPTION[12]="12.  $(text 57)"
 
     ACTION[1]() { export_list; exit 0; }
     [[ ${STATUS[0]} = "$(text 28)" ]] &&
@@ -4821,11 +4897,12 @@ menu_setting() {
     ACTION[4]() { change_argo; exit; }
     ACTION[5]() { change_config; exit; }
     ACTION[6]() { change_protocols; exit; }
-    ACTION[7]() { version; exit; }
-    ACTION[8]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh); exit; }
-    ACTION[9]() { uninstall; exit; }
-    ACTION[10]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh) -$L; exit; }
-    ACTION[11]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sba/main/sba.sh) -$L; exit; }
+    ACTION[7]() { renew_warp_account; exit; }
+    ACTION[8]() { version; exit; }
+    ACTION[9]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh); exit; }
+    ACTION[10]() { uninstall; exit; }
+    ACTION[11]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh) -$L; exit; }
+    ACTION[12]() { bash <(wget --no-check-certificate -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sba/main/sba.sh) -$L; exit; }
 
   else
     OPTION[1]="1.  $(text 77)"
@@ -4993,7 +5070,7 @@ unset _NEED_RESTART_XRAY _NEED_RELOAD_NGINX
 [[ "${*,,}" =~ '-e'|'-k' ]] && L=E
 [[ "${*,,}" =~ '-c'|'-b'|'-l' ]] && L=C
 
-while getopts ":AaXxTtDdUuNnVvBbRrF:f:KkLl" OPTNAME; do
+while getopts ":AaXxTtDdUuNnVvBbRrWwF:f:KkLl" OPTNAME; do
   case "${OPTNAME,,}" in
     a ) select_language; check_system_info; check_install
         [ "${STATUS[0]}" = "$(text 28)" ] && {
@@ -5022,6 +5099,7 @@ while getopts ":AaXxTtDdUuNnVvBbRrF:f:KkLl" OPTNAME; do
     t ) select_language; check_system_info; check_arch; change_argo; exit 0 ;;
     d ) select_language; check_system_info; change_config; exit 0 ;;
     r ) select_language; check_system_info; check_install; change_protocols; exit 0 ;;
+    w ) select_language; check_system_info; check_install; renew_warp_account; exit 0 ;;
     u ) select_language; check_system_info; uninstall; exit 0;;
     n ) select_language; check_system_info; export_list; exit 0 ;;
     v ) select_language; check_system_info; check_arch; version; exit 0;;
