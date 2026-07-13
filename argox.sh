@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.11 (2026.07.14)'
+VERSION='2.0.12 (2026.07.14)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -39,10 +39,28 @@ WARP_SHARED_ADDR_V6='2606:4700:110:8a36:df92:102a:9602:fa18/128'
 WARP_MTU_DEFAULT=1200
 WARP_KEEPALIVE_DEFAULT=30
 WARP_ENDPOINT_DEFAULT='162.159.192.1:2408'
+# 重新注册时最多尝试轮数（每轮：新账号 + 不同 Endpoint），尽量拿到不同出口 IP
+WARP_REREG_TRIES_DEFAULT=3
+# Cloudflare WARP Anycast 候选（IP 优先；同 IP 不同端口也可能落到不同 PoP）
 WARP_ENDPOINT_CANDIDATES=(
   '162.159.192.1:2408'
   '162.159.193.1:2408'
+  '162.159.195.1:2408'
   '162.159.192.2:2408'
+  '162.159.193.2:2408'
+  '162.159.195.2:2408'
+  '162.159.192.3:2408'
+  '162.159.193.3:2408'
+  '188.114.96.1:2408'
+  '188.114.97.1:2408'
+  '188.114.98.1:2408'
+  '188.114.99.1:2408'
+  '162.159.192.1:500'
+  '162.159.192.1:1701'
+  '162.159.192.1:4500'
+  '162.159.193.1:500'
+  '162.159.193.1:1701'
+  '162.159.193.1:4500'
   'engage.cloudflareclient.com:2408'
 )
 
@@ -59,8 +77,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="v2.0.11: Split WARP actions: change endpoint vs re-register account"
-C[1]="v2.0.11: WARP 拆为两项：更换 Endpoint / 重新注册账号"
+E[1]="v2.0.12: Prefer different WARP exit IPs via endpoint rotation + multi-try re-register"
+C[1]="v2.0.12: 通过轮换 Endpoint + 多轮重注册尽量拿到不同 WARP 出口 IP"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -333,6 +351,22 @@ E[136]="WARP endpoint updated: \${_old} -> \${_new}. Restarting Xray to apply."
 C[136]="WARP Endpoint 已更新：\${_old} -> \${_new}。正在重启 Xray 使配置生效。"
 E[137]="WARP endpoint unchanged."
 C[137]="WARP Endpoint 未变更。"
+E[138]="Probing WARP exit IP..."
+C[138]="正在探测 WARP 出口 IP..."
+E[139]="WARP exit IP: \${_old_ip} -> \${_new_ip}"
+C[139]="WARP 出口 IP：\${_old_ip} -> \${_new_ip}"
+E[140]="Exit IP still the same after \${_tries} attempt(s). Free WARP often shares a PoP CGNAT pool; try again later or pick another endpoint."
+C[140]="\${_tries} 轮后出口 IP 仍相同。免费 WARP 常共享同一 PoP 的 CGNAT 池，可稍后再试或换 Endpoint。"
+E[141]="0. Random different endpoint (recommended)"
+C[141]="0. 随机更换不同 Endpoint（推荐）"
+E[142]="Attempt \${_i}/\${_tries}: re-register + rotate endpoint..."
+C[142]="第 \${_i}/\${_tries} 轮：重新注册并轮换 Endpoint..."
+E[143]="Rotated WARP endpoint: \${_old} -> \${_new}"
+C[143]="已轮换 WARP Endpoint：\${_old} -> \${_new}"
+E[144]="Could not probe WARP exit IP (account/endpoint still applied)."
+C[144]="无法探测 WARP 出口 IP（账号/Endpoint 仍已生效）。"
+E[145]="This will re-register free WARP, rotate endpoint, and retry up to \${_tries} time(s) for a different exit IP. Continue? [y/N]:"
+C[145]="将重新注册 free WARP、轮换 Endpoint，最多尝试 \${_tries} 轮以尽量换出口 IP。继续？ [y/N]:"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -563,18 +597,37 @@ warp_client_id_to_reserved() {
   printf '%s,%s,%s' "$_b1" "$_b2" "$_b3"
 }
 
+# 生成随机 install_id（尽量让每次注册身份更独立）
+warp_random_install_id() {
+  local _id
+  if command -v uuidgen >/dev/null 2>&1; then
+    _id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  elif [ -r /proc/sys/kernel/random/uuid ]; then
+    _id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+  else
+    _id=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$_id" ] && _id="${_id:0:8}-${_id:8:4}-${_id:12:4}-${_id:16:4}-${_id:20:12}"
+  fi
+  printf '%s' "${_id:-argox-$(date +%s)}"
+}
+
 # 向 Cloudflare 注册 free WARP，成功则设置 WARP_* 全局变量
 register_warp_free() {
-  local _priv _pub _body _tos _resp _api _jq _cid _v4 _v6 _rsv
+  local _priv _pub _body _tos _resp _api _jq _cid _v4 _v6 _rsv _iid _model _models
   warp_gen_x25519_keypair || return 1
   _priv="$WARP_GEN_PRIVATE"
   _pub="$WARP_GEN_PUBLIC"
   _tos=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
-  _body=$(printf '{"key":"%s","install_id":"","fcm_token":"","tos":"%s","model":"argox","serial_number":"","locale":"en_US"}' "$_pub" "$_tos")
+  _iid=$(warp_random_install_id)
+  _models=("argox" "PC" "Android" "iOS" "linux")
+  _model="${_models[$((RANDOM % ${#_models[@]}))]}"
+  _body=$(printf '{"key":"%s","install_id":"%s","fcm_token":"%s","tos":"%s","model":"%s","serial_number":"","locale":"en_US"}' \
+    "$_pub" "$_iid" "$_iid" "$_tos" "$_model")
   _resp=''
   for _api in \
     'https://api.cloudflareclient.com/v0a2158/reg' \
-    'https://api.cloudflareclient.com/v0a1922/reg'; do
+    'https://api.cloudflareclient.com/v0a1922/reg' \
+    'https://api.cloudflareclient.com/v0a2471/reg'; do
     _resp=$(wget --no-check-certificate -qO- --timeout=15 --tries=2 \
       --header='Content-Type: application/json' \
       --header='CF-Client-Version: a-6.10-2158' \
@@ -621,9 +674,31 @@ register_warp_free() {
   return 0
 }
 
+# 简单连通性探测（TCP，仅作粗筛；WARP 实际是 UDP）
+warp_endpoint_reachable() {
+  local _ep="$1" _host _port
+  [ -n "$_ep" ] || return 1
+  if [[ "$_ep" =~ ^\[.+\]:[0-9]+$ ]]; then
+    _host="${_ep%]*}"
+    _host="${_host#[}"
+    _port="${_ep##*:}"
+  else
+    _host=${_ep%:*}
+    _port=${_ep##*:}
+  fi
+  # IPv6 / 域名 : 跳过 /dev/tcp 粗测，视为可用
+  [[ "$_host" == *:* || "$_host" == *.*[A-Za-z]* || "$_host" == *engage* ]] && return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 1 bash -c "echo >/dev/tcp/${_host}/${_port}" 2>/dev/null && return 0
+  else
+    (bash -c "echo >/dev/tcp/${_host}/${_port}") >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
 # 选择 WireGuard endpoint：自定义 > custom 文件 > 候选 IP 连通性探测 > 默认
 pick_warp_endpoint() {
-  local _ep _c _host _port
+  local _ep _c
   if [ -n "${WARP_ENDPOINT:-}" ]; then
     printf '%s' "$WARP_ENDPOINT"
     return
@@ -633,15 +708,38 @@ pick_warp_endpoint() {
     [ -n "$_ep" ] && { printf '%s' "$_ep"; return; }
   fi
   for _c in "${WARP_ENDPOINT_CANDIDATES[@]}"; do
-    _host=${_c%:*}
-    _port=${_c##*:}
-    if command -v timeout >/dev/null 2>&1; then
-      timeout 1 bash -c "echo >/dev/tcp/${_host}/${_port}" 2>/dev/null && { printf '%s' "$_c"; return; }
-    else
-      (bash -c "echo >/dev/tcp/${_host}/${_port}") >/dev/null 2>&1 && { printf '%s' "$_c"; return; }
-    fi
+    warp_endpoint_reachable "$_c" && { printf '%s' "$_c"; return; }
   done
   printf '%s' "${WARP_ENDPOINT_DEFAULT}"
+}
+
+# 随机挑一个与 exclude 不同的 Endpoint
+# 注意：WARP 走 UDP，不依赖 TCP 粗测（避免误过滤）
+# 用法: pick_random_warp_endpoint [exclude_endpoint]
+pick_random_warp_endpoint() {
+  local _exclude="${1:-}" _c _pool=() _i _n
+  for _c in "${WARP_ENDPOINT_CANDIDATES[@]}"; do
+    [ -n "$_exclude" ] && [ "$_c" = "$_exclude" ] && continue
+    _pool+=("$_c")
+  done
+  [ "${#_pool[@]}" -eq 0 ] && _pool=("${WARP_ENDPOINT_CANDIDATES[@]}")
+  _n=${#_pool[@]}
+  _i=$((RANDOM % _n))
+  printf '%s' "${_pool[$_i]}"
+}
+
+# 强制切换到与当前不同的 Endpoint，并写入 custom / 内存
+# 用法: rotate_warp_endpoint [exclude]
+# 成功时设置 ROTATED_WARP_ENDPOINT
+rotate_warp_endpoint() {
+  local _old _new
+  _old="${1:-$(get_current_warp_endpoint 2>/dev/null || true)}"
+  _new=$(pick_random_warp_endpoint "$_old")
+  [ -n "$_new" ] || return 1
+  WARP_ENDPOINT="$_new"
+  write_custom 'warpEndpoint' "$_new" 2>/dev/null || true
+  ROTATED_WARP_ENDPOINT="$_new"
+  return 0
 }
 
 # 将 WARP 凭证写入 custom（安装/迁移后可复用）
@@ -806,9 +904,87 @@ get_current_warp_endpoint() {
   pick_warp_endpoint
 }
 
+# 通过临时 Xray socks 探测当前 WARP 出口公网 IP（依赖已写入的 outbound.json）
+# 结果写入 PROBED_WARP_EXIT_IP；失败返回 1
+probe_warp_exit_ip() {
+  local _jq _xray _cfg _port _pid _ip _url _socks
+  local -a _urls
+  PROBED_WARP_EXIT_IP=''
+  _jq=$(_jq_bin 2>/dev/null) || return 1
+  _xray=''
+  [ -x "$WORK_DIR/xray" ] && _xray="$WORK_DIR/xray"
+  [ -z "$_xray" ] && [ -x "$TEMP_DIR/xray" ] && _xray="$TEMP_DIR/xray"
+  [ -n "$_xray" ] || return 1
+  [ -s "$WORK_DIR/outbound.json" ] || return 1
+
+  mkdir -p "$TEMP_DIR" 2>/dev/null || true
+  _port=$((18000 + RANDOM % 1000))
+  _cfg="$TEMP_DIR/warp-probe-$$.json"
+  # 合并 wireguard + warp-IPv4 出站，挂一个本地 socks 入站
+  "$_jq" -n \
+    --slurpfile ob "$WORK_DIR/outbound.json" \
+    --argjson port "$_port" '
+    ($ob[0].outbounds // []) as $outs
+    | {
+        log: {loglevel: "none"},
+        inbounds: [{
+          listen: "127.0.0.1",
+          port: $port,
+          protocol: "socks",
+          settings: {udp: true, auth: "noauth"},
+          tag: "probe-in"
+        }],
+        outbounds: (
+          [ $outs[] | select(.tag == "wireguard" or .tag == "warp-IPv4") ]
+          + [{protocol:"freedom", tag:"direct"}]
+        ),
+        routing: {
+          domainStrategy: "AsIs",
+          rules: [{type:"field", inboundTag:["probe-in"], outboundTag:"warp-IPv4"}]
+        }
+      }
+  ' > "$_cfg" 2>/dev/null || return 1
+
+  "$_xray" run -c "$_cfg" >/dev/null 2>&1 &
+  _pid=$!
+  sleep 1
+  if ! kill -0 "$_pid" 2>/dev/null; then
+    rm -f "$_cfg"
+    return 1
+  fi
+
+  _socks="127.0.0.1:${_port}"
+  _urls=(
+    'https://api.ipify.org'
+    'https://ipv4.icanhazip.com'
+    'https://ifconfig.me/ip'
+    'https://ip.sb'
+  )
+  _ip=''
+  for _url in "${_urls[@]}"; do
+    if command -v curl >/dev/null 2>&1; then
+      _ip=$(curl -sS --max-time 8 --proxy "socks5h://${_socks}" "$_url" 2>/dev/null | tr -d '[:space:]')
+    else
+      _ip=$(wget -qO- --timeout=8 -e "use_proxy=yes" -e "https_proxy=socks5h://${_socks}" "$_url" 2>/dev/null | tr -d '[:space:]')
+    fi
+    # 粗校验 IPv4
+    if [[ "$_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      break
+    fi
+    _ip=''
+  done
+
+  kill "$_pid" 2>/dev/null || true
+  wait "$_pid" 2>/dev/null || true
+  rm -f "$_cfg"
+  [ -n "$_ip" ] || return 1
+  PROBED_WARP_EXIT_IP="$_ip"
+  return 0
+}
+
 # 更换 WARP Endpoint（不换账号；有时会换出口 PoP，不保证）
 change_warp_endpoint() {
-  local _jq _cur _input _new _old _i
+  local _jq _cur _input _new _old _i _old_ip _new_ip
 
   [ ! -d "$WORK_DIR" ] && error " $(text 39) "
   [ ! -s "$WORK_DIR/inbound.json" ] && error " $(text 39) "
@@ -817,13 +993,16 @@ change_warp_endpoint() {
   _cur=$(get_current_warp_endpoint)
   _old="$_cur"
   hint "\n $(text 133) \n"
+  hint " $(text 141) "
   for _i in "${!WARP_ENDPOINT_CANDIDATES[@]}"; do
     hint " $((_i + 1)). ${WARP_ENDPOINT_CANDIDATES[_i]} "
   done
   reading "\n $(text 134) " _input
   [ -z "$_input" ] && info " $(text 137) " && return 0
 
-  if [[ "$_input" =~ ^[1-9][0-9]*$ ]] && [ "$_input" -le "${#WARP_ENDPOINT_CANDIDATES[@]}" ]; then
+  if [ "$_input" = "0" ]; then
+    _new=$(pick_random_warp_endpoint "$_old")
+  elif [[ "$_input" =~ ^[1-9][0-9]*$ ]] && [ "$_input" -le "${#WARP_ENDPOINT_CANDIDATES[@]}" ]; then
     _new="${WARP_ENDPOINT_CANDIDATES[$((_input - 1))]}"
   else
     _new="$_input"
@@ -832,6 +1011,12 @@ change_warp_endpoint() {
   if [ "$_new" = "$_old" ]; then
     info " $(text 137) "
     return 0
+  fi
+
+  # 换前探测（失败忽略）
+  _old_ip=''
+  if probe_warp_exit_ip; then
+    _old_ip="$PROBED_WARP_EXIT_IP"
   fi
 
   WARP_ENDPOINT="$_new"
@@ -848,24 +1033,23 @@ change_warp_endpoint() {
   else
     warning "\n Xray $(text 27) $(text 38) \n"
   fi
+
+  # 换后探测
+  if probe_warp_exit_ip; then
+    _new_ip="$PROBED_WARP_EXIT_IP"
+    _old_ip=${_old_ip:-(unknown)}
+    info " $(text 139) "
+  else
+    warning " $(text 144) "
+  fi
 }
 
-# 重新注册 free WARP 账号并重写 outbound（换身份，更有机会换出口 IP）
-# 用法: renew_warp_account [force]
-#   force: 跳过确认（CLI 非交互场景可传）
-renew_warp_account() {
-  local _force="${1:-}" _confirm _kind _old_sk _new_sk _jq
+# 单次：清凭证 → 可选轮换 endpoint → 强制重注册 → 写 outbound
+# 成功返回 0；设置 RENEW_WARP_KIND
+_renew_warp_account_once() {
+  local _rotate="${1:-1}" _old_sk _new_sk _jq _old_ep _new_ep _old _new
+  _jq=$(_jq_bin) || return 1
 
-  [ ! -d "$WORK_DIR" ] && error " $(text 39) "
-  [ ! -s "$WORK_DIR/inbound.json" ] && error " $(text 39) "
-  _jq=$(_jq_bin) || error " $(text 39) "
-
-  if [ "$_force" != "force" ]; then
-    reading " $(text 129) " _confirm
-    [[ ! "${_confirm,,}" =~ ^y(es)?$ ]] && info " $(text 131) " && return 0
-  fi
-
-  # 记录旧 secretKey，便于判断是否真正换号
   _old_sk=''
   if [ -s "$WORK_DIR/outbound.json" ]; then
     _old_sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
@@ -873,32 +1057,118 @@ renew_warp_account() {
   [ -z "$_old_sk" ] && [ -s "$CUSTOM_FILE" ] && \
     _old_sk=$(awk -F= '/^warpSecretKey=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
 
-  # 清掉 custom 中的旧凭证；保留 endpoint / mtu 自定义
+  # 清掉 custom 中的旧凭证；endpoint 由 rotate 决定是否保留
   if [ -s "$CUSTOM_FILE" ]; then
     sed -i '/^warpSecretKey=/d;/^warpAddrV4=/d;/^warpAddrV6=/d;/^warpReserved=/d;/^warpAccount=/d' "$CUSTOM_FILE" 2>/dev/null || true
   fi
   unset WARP_SECRET_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED
-  WARP_FORCE_REREG=1
 
-  write_outbound_json || error " $(text 38) "
+  if [ "$_rotate" = "1" ]; then
+    _old_ep=$(get_current_warp_endpoint 2>/dev/null || true)
+    # 清除内存/custom 锁定的 endpoint，再随机换一个
+    unset WARP_ENDPOINT
+    if [ -s "$CUSTOM_FILE" ]; then
+      sed -i '/^warpEndpoint=/d' "$CUSTOM_FILE" 2>/dev/null || true
+    fi
+    rotate_warp_endpoint "$_old_ep" || true
+    _new_ep="${ROTATED_WARP_ENDPOINT:-$(pick_warp_endpoint)}"
+    if [ -n "$_old_ep" ] && [ -n "$_new_ep" ] && [ "$_old_ep" != "$_new_ep" ]; then
+      _old="$_old_ep"; _new="$_new_ep"
+      hint " $(text 143) "
+    fi
+  fi
+
+  WARP_FORCE_REREG=1
+  write_outbound_json || { unset WARP_FORCE_REREG; return 1; }
   unset WARP_FORCE_REREG
 
   _new_sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
-  _kind=$(awk -F= '/^warpAccount=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
-  _kind=${_kind:-unknown}
+  RENEW_WARP_KIND=$(awk -F= '/^warpAccount=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+  RENEW_WARP_KIND=${RENEW_WARP_KIND:-unknown}
   if [ -n "$_new_sk" ] && [ "$_new_sk" = "$WARP_SHARED_SECRET_KEY" ]; then
-    _kind='shared'
+    RENEW_WARP_KIND='shared'
   elif [ -n "$_new_sk" ] && [ "$_new_sk" != "$_old_sk" ]; then
-    _kind='independent'
+    RENEW_WARP_KIND='independent'
+  fi
+  return 0
+}
+
+# 重新注册 free WARP 账号并重写 outbound（换身份 + 轮换 Endpoint，尽量换出口 IP）
+# 用法: renew_warp_account [force]
+#   force: 跳过确认（CLI 非交互场景可传）
+# 环境变量:
+#   WARP_REREG_TRIES=N  最多尝试轮数（默认 3）
+renew_warp_account() {
+  local _force="${1:-}" _confirm _kind _jq _tries _i _old_ip _new_ip _changed
+
+  [ ! -d "$WORK_DIR" ] && error " $(text 39) "
+  [ ! -s "$WORK_DIR/inbound.json" ] && error " $(text 39) "
+  _jq=$(_jq_bin) || error " $(text 39) "
+
+  _tries=${WARP_REREG_TRIES:-$WARP_REREG_TRIES_DEFAULT}
+  [[ "$_tries" =~ ^[1-9][0-9]*$ ]] || _tries=$WARP_REREG_TRIES_DEFAULT
+  [ "$_tries" -gt 8 ] && _tries=8
+
+  if [ "$_force" != "force" ]; then
+    reading " $(text 145) " _confirm
+    [[ ! "${_confirm,,}" =~ ^y(es)?$ ]] && info " $(text 131) " && return 0
   fi
 
+  # 换前探测旧出口（失败忽略）
+  _old_ip=''
+  hint " $(text 138) "
+  if probe_warp_exit_ip; then
+    _old_ip="$PROBED_WARP_EXIT_IP"
+    hint "  (current: ${_old_ip}) "
+  fi
+
+  _changed=false
+  _new_ip=''
+  _kind='unknown'
+  for ((_i=1; _i<=_tries; _i++)); do
+    hint " $(text 142) "
+    _renew_warp_account_once 1 || continue
+    _kind="$RENEW_WARP_KIND"
+
+    cmd_systemctl restart xray
+    sleep 2
+    if ! cmd_systemctl status xray &>/dev/null; then
+      warning "\n Xray $(text 27) $(text 38) \n"
+      continue
+    fi
+
+    # 无旧 IP 时：至少完成 1 轮即结束；有旧 IP 时尽量换到不同
+    if probe_warp_exit_ip; then
+      _new_ip="$PROBED_WARP_EXIT_IP"
+      if [ -z "$_old_ip" ] || [ "$_new_ip" != "$_old_ip" ]; then
+        _changed=true
+        break
+      fi
+    else
+      # 探测失败但账号已换：首轮即可结束，避免死循环
+      if [ "$_i" -ge "$_tries" ] || [ -z "$_old_ip" ]; then
+        break
+      fi
+    fi
+    # 轮间稍等，降低 API 限流概率
+    [ "$_i" -lt "$_tries" ] && sleep 2
+  done
+
   info " $(text 130) "
-  cmd_systemctl restart xray
-  sleep 2
   if cmd_systemctl status xray &>/dev/null; then
     info "\n Xray $(text 28) $(text 37) \n"
   else
     warning "\n Xray $(text 27) $(text 38) \n"
+  fi
+
+  if [ -n "$_new_ip" ]; then
+    _old_ip=${_old_ip:-(unknown)}
+    info " $(text 139) "
+    if [ "$_changed" = false ] && [ "$_old_ip" = "$_new_ip" ]; then
+      warning " $(text 140) "
+    fi
+  elif [ -n "$_old_ip" ]; then
+    warning " $(text 144) "
   fi
 }
 
