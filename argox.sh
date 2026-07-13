@@ -555,7 +555,8 @@ write_outbound_json() {
                             "0.0.0.0/0",
                             "::/0"
                         ],
-                        "endpoint": "engage.cloudflareclient.com:2408"
+                        "endpoint": "engage.cloudflareclient.com:2408",
+                        "keepAlive": 25
                     }
                 ],
                 "reserved": [
@@ -563,7 +564,9 @@ write_outbound_json() {
                     135,
                     76
                 ],
-                "mtu": 1280
+                "mtu": 1280,
+                "domainStrategy": "ForceIPv4",
+                "noKernelTun": true
             }
         },
         {
@@ -572,9 +575,10 @@ write_outbound_json() {
             "settings": {
                 "domainStrategy": "UseIPv4"
             },
-            "proxySettings": {
-                "tag": "wireguard",
-                "transportLayer": true
+            "streamSettings": {
+                "sockopt": {
+                    "dialerProxy": "wireguard"
+                }
             }
         },
         {
@@ -583,9 +587,10 @@ write_outbound_json() {
             "settings": {
                 "domainStrategy": "UseIPv6"
             },
-            "proxySettings": {
-                "tag": "wireguard",
-                "transportLayer": true
+            "streamSettings": {
+                "sockopt": {
+                    "dialerProxy": "wireguard"
+                }
             }
         }
     ],
@@ -2186,9 +2191,10 @@ json_nginx() {
     NGINX_PORT=${NGINX_PORT:-"$NGINX_PORT_DEFAULT"}
   fi
 
+  # 必须用 $ 锚定：否则 ^/argox-vl 会抢先匹配 /argox-vl-warp，导致 WARP 节点走普通入站
   _ws_location() {
     local path=$1 port=$2
-    printf '    location ~ ^%s {\n' "$path"
+    printf '    location ~ ^%s$ {\n' "$path"
     printf '      proxy_pass          http://127.0.0.1:%s;\n' "$port"
     printf '      proxy_http_version  1.1;\n'
     printf '      proxy_set_header    Upgrade $http_upgrade;\n'
@@ -2205,7 +2211,7 @@ json_nginx() {
 
   _xhttp_location() {
     local path=$1 port=$2
-    printf '    location ~ ^%s {\n' "$path"
+    printf '    location ~ ^%s$ {\n' "$path"
     printf '      proxy_pass                  http://127.0.0.1:%s;\n' "$port"
     printf '      proxy_http_version          1.1;\n'
     printf '      proxy_set_header            Host $host;\n'
@@ -2254,25 +2260,26 @@ json_nginx() {
   _PORT_XH_W=${_PORT_XH_W:-${VLESS_XHTTP_WARP_PORT}}
 
   _add_location() { SERVER_BLOCK+="$1"; SERVER_BLOCK+=$'\n\n'; }
+  # 先写 -warp 再写普通路径，避免历史配置/误改正则时被前缀抢匹配
   grep -q 'vless-ws' <<< "$PROTOCOLS_NOW" && {
-    _add_location "$(_ws_location "/${WS_PATH}-vl" "$_PORT_VL")"
     [ -n "$_PORT_VL_W" ] && _add_location "$(_ws_location "/${WS_PATH}-vl-warp" "$_PORT_VL_W")"
+    _add_location "$(_ws_location "/${WS_PATH}-vl" "$_PORT_VL")"
   }
   grep -q 'vmess-ws' <<< "$PROTOCOLS_NOW" && {
-    _add_location "$(_ws_location "/${WS_PATH}-vm" "$_PORT_VM")"
     [ -n "$_PORT_VM_W" ] && _add_location "$(_ws_location "/${WS_PATH}-vm-warp" "$_PORT_VM_W")"
+    _add_location "$(_ws_location "/${WS_PATH}-vm" "$_PORT_VM")"
   }
   grep -q 'trojan-ws' <<< "$PROTOCOLS_NOW" && {
-    _add_location "$(_ws_location "/${WS_PATH}-tr" "$_PORT_TR")"
     [ -n "$_PORT_TR_W" ] && _add_location "$(_ws_location "/${WS_PATH}-tr-warp" "$_PORT_TR_W")"
+    _add_location "$(_ws_location "/${WS_PATH}-tr" "$_PORT_TR")"
   }
   grep -qw 'ss-ws' <<< "$PROTOCOLS_NOW" && {
-    _add_location "$(_ws_location "/${WS_PATH}-sh" "$_PORT_SH")"
     [ -n "$_PORT_SH_W" ] && _add_location "$(_ws_location "/${WS_PATH}-sh-warp" "$_PORT_SH_W")"
+    _add_location "$(_ws_location "/${WS_PATH}-sh" "$_PORT_SH")"
   }
   grep -q 'xhttp-h1.1-cdn' <<< "$PROTOCOLS_NOW" && {
-    _add_location "$(_xhttp_location "/${WS_PATH}-xh" "${_PORT_XH}")"
     [ -n "$_PORT_XH_W" ] && _add_location "$(_xhttp_location "/${WS_PATH}-xh-warp" "${_PORT_XH_W}")"
+    _add_location "$(_xhttp_location "/${WS_PATH}-xh" "${_PORT_XH}")"
   }
   local SUB_BLOCK
   SUB_BLOCK=$(printf '    location ~ ^/%s/auto {
@@ -4617,30 +4624,54 @@ if [ -s $WORK_DIR/nginx.conf ] && grep -q 'v2rayN|Neko|Throne' $WORK_DIR/nginx.c
   export_list >/dev/null 2>&1
 fi
 
-# 已安装环境：补齐 WARP 链式所需的 transportLayer（旧配置缺此项会导致 WireGuard 链式不通）
-# 放在 getopts 之前，保证 argox -n / 菜单等入口都会执行
-if [ -s "$WORK_DIR/outbound.json" ] && ! grep -q '"transportLayer"' "$WORK_DIR/outbound.json" 2>/dev/null; then
-  if [ -x "$WORK_DIR/jq" ]; then
+# 已安装环境迁移（放在 getopts 前，argox -n / 菜单均会执行）
+# 1) nginx: ^/path 会抢匹配 /path-warp → 加 $ 锚定
+# 2) outbound: WARP 改用 sockopt.dialerProxy，并加固 wireguard
+_NEED_RESTART_XRAY=false
+_NEED_RELOAD_NGINX=false
+if [ -s "$WORK_DIR/nginx.conf" ] && grep -Eq 'location ~ \^[^[:space:]]+-(vl|vm|tr|sh|xh)(-warp)? \{' "$WORK_DIR/nginx.conf" 2>/dev/null; then
+  sed -i -E 's|(location ~ \^[^[:space:]]+-(vl|vm|tr|sh|xh)(-warp)?) \{|\1$ {|g' "$WORK_DIR/nginx.conf"
+  _NEED_RELOAD_NGINX=true
+fi
+if [ -s "$WORK_DIR/outbound.json" ] && [ -x "$WORK_DIR/jq" ]; then
+  if ! grep -q '"dialerProxy"[[:space:]]*:[[:space:]]*"wireguard"' "$WORK_DIR/outbound.json" 2>/dev/null \
+     || ! grep -q '"noKernelTun"' "$WORK_DIR/outbound.json" 2>/dev/null; then
     _OUT_TMP=$(mktemp 2>/dev/null || echo "$TEMP_DIR/outbound.fix")
     if "$WORK_DIR/jq" '
       .outbounds |= map(
-        if (.tag == "warp-IPv4" or .tag == "warp-IPv6") and (.proxySettings.tag? == "wireguard")
-        then .proxySettings.transportLayer = true
+        if .tag == "wireguard" and .protocol == "wireguard" then
+          .settings.domainStrategy = (.settings.domainStrategy // "ForceIPv4")
+          | .settings.noKernelTun = true
+          | .settings.mtu = (.settings.mtu // 1280)
+          | .settings.peers |= map(.keepAlive = (.keepAlive // 25))
+        elif (.tag == "warp-IPv4" or .tag == "warp-IPv6") then
+          del(.proxySettings)
+          | .streamSettings.sockopt.dialerProxy = "wireguard"
         else . end
       )
     ' "$WORK_DIR/outbound.json" > "$_OUT_TMP" 2>/dev/null && [ -s "$_OUT_TMP" ]; then
       mv "$_OUT_TMP" "$WORK_DIR/outbound.json"
-      if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet xray 2>/dev/null; then
-        systemctl restart xray >/dev/null 2>&1 || true
-      elif [ -x /etc/init.d/xray ]; then
-        /etc/init.d/xray restart >/dev/null 2>&1 || true
-      fi
+      _NEED_RESTART_XRAY=true
     else
       rm -f "$_OUT_TMP" 2>/dev/null
     fi
     unset _OUT_TMP
   fi
 fi
+if $_NEED_RELOAD_NGINX; then
+  if command -v nginx >/dev/null 2>&1 && [ -s "$WORK_DIR/nginx.conf" ]; then
+    nginx -t -c "$WORK_DIR/nginx.conf" >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 \
+      || { pgrep -f "nginx: master process" >/dev/null 2>&1 && kill -HUP "$(pgrep -f 'nginx: master process' | head -1)" >/dev/null 2>&1 || true; }
+  fi
+fi
+if $_NEED_RESTART_XRAY; then
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet xray 2>/dev/null; then
+    systemctl restart xray >/dev/null 2>&1 || true
+  elif [ -x /etc/init.d/xray ]; then
+    /etc/init.d/xray restart >/dev/null 2>&1 || true
+  fi
+fi
+unset _NEED_RESTART_XRAY _NEED_RELOAD_NGINX
 
 # 传参
 [[ "${*,,}" =~ '-e'|'-k' ]] && L=E
