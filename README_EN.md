@@ -122,7 +122,7 @@
 ## Interactive Running Script
 
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh)
 ```
 
   | Option | Remark |
@@ -150,12 +150,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh)
 
 ### Chinese
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) -l
+bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh) -l
 ```
 
 ### English
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh) -k
+bash <(wget -qO- https://raw.githubusercontent.com/assast/argox/main/argox.sh) -k
 ```
 
 ## Obtaining Argo Json
