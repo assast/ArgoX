@@ -24,8 +24,8 @@ CUSTOM_FILE="$WORK_DIR/custom"
 FIREWALL_STATE_DIR="${WORK_DIR}/firewall"
 SERVICE_FIREWALL_STATE_FILE="${FIREWALL_STATE_DIR}/service_ports.list"
 TLS_SERVER='addons.mozilla.org'
-START_PORT_DEFAULT='30000'  # WS/XHTTP 内部端口起始值，各协议在此基础上顺数
-NGINX_PORT_DEFAULT='8080'   # Nginx 默认端口，可交互修改
+START_PORT_DEFAULT='55023'  # WS/XHTTP 内部端口起始值，各协议在此基础上顺数
+NGINX_PORT_DEFAULT='8001'   # Nginx 默认端口，可交互修改
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.2020111.xyz" "xn--b6gac.eu.org" "cf.090227.xyz")
 SUBSCRIBE_TEMPLATE="https://raw.githubusercontent.com/fscarmen/client_template/main"
 DEFAULT_XRAY_VERSION='26.2.6'
@@ -215,8 +215,8 @@ E[85]="API does not have enough permissions. Please check at https://dash.cloudf
 C[85]="API 没有足够权限，请在 https://dash.cloudflare.com/profile/api-tokens 检查 Token 权限配置\n\n [*] Token: 访问 https://dash.cloudflare.com/ ，Zero Trust > 网络 > 连接器 > 创建隧道 > 选择 Cloudflared\n\n [*] Json: 用户通过以下网站轻松获取: https://fscarmen.cloudflare.now.cc\n\n [*] Cloudflare API: 访问 https://dash.cloudflare.com/profile/api-tokens > 创建令牌 > 创建自定义令牌 > 添加以下权限:\n - 帐户 > Cloudflare One连接器: Cloudflared > 编辑\n - 区域 > DNS > 编辑\n\n - 帐户资源: 包括 > 所需账户\n - 区域资源: 包括 > 特定区域 > 所需域名"
 E[86]="Please enter [Token, Json, API] value:"
 C[86]="请输入 [Token, Json, API] 的值:"
-E[87]="(\${STEP_NUM}/\${TOTAL_STEPS:-?}) Select protocols to install (e.g. bdf). a = all (default):"
-C[87]="(\${STEP_NUM}/\${TOTAL_STEPS:-?}) 选择要安装的协议（如 bdf），a = 全部（默认）:"
+E[87]="(\${STEP_NUM}/\${TOTAL_STEPS:-?}) Select protocols to install (e.g. bdf). a = all, empty = e VLESS + WS (default):"
+C[87]="(\${STEP_NUM}/\${TOTAL_STEPS:-?}) 选择要安装的协议（如 bdf），a = 全部，回车默认 e (VLESS + WS):"
 E[88]="Installed protocols."
 C[88]="已安装的协议"
 E[89]="Please select protocols to remove (multiple allowed, Enter to skip):"
@@ -241,8 +241,8 @@ E[98]="\${TOTAL_STEPS:+(\${STEP_NUM}/\${TOTAL_STEPS}) }Please enter the Reality 
 C[98]="\${TOTAL_STEPS:+(\${STEP_NUM}/\${TOTAL_STEPS}) }请输入 Reality 的密钥(privateKey)，跳过则随机生成 (默认为随机生成):"
 E[99]="Invalid Reality privateKey, generating randomly..."
 C[99]="Reality 私钥无效，随机生成中..."
-E[100]=" a. all (default)"
-C[100]=" a. 全部（默认）"
+E[100]=" a. all"
+C[100]=" a. 全部"
 E[101]="${PROTOCOL_LIST[7]} (Temporary tunnel NOT supported)"
 C[101]="${PROTOCOL_LIST[7]}（临时隧道不支持）"
 E[102]="Cannot get quicktunnel domain."
@@ -974,12 +974,14 @@ xray_variable() {
 
   if [ -z "${INSTALL_PROTOCOLS[*]}" ]; then
     local MAX_LETTER=$(asc $((97 + ${#PROTOCOL_LIST[@]})))
-    if [[ -z "$CHOOSE_PROTOCOLS" || "${CHOOSE_PROTOCOLS,,}" =~ ^a$ ]]; then
+    if [[ -z "$CHOOSE_PROTOCOLS" ]]; then
+      INSTALL_PROTOCOLS=(e)
+    elif [[ "${CHOOSE_PROTOCOLS,,}" =~ ^a$ ]]; then
       read -r -a INSTALL_PROTOCOLS <<< "${_all_protocol_letters% }"
     else
       local filtered
       filtered=$(grep -o . <<< "${CHOOSE_PROTOCOLS,,}" | grep -E "^[b-${MAX_LETTER}]$" | awk '!seen[$0]++' | tr -d '\n')
-      [ -z "$filtered" ] && read -r -a INSTALL_PROTOCOLS <<< "${_all_protocol_letters% }" || {
+      [ -z "$filtered" ] && INSTALL_PROTOCOLS=(e) || {
         INSTALL_PROTOCOLS=()
         while IFS= read -r -n1 ch; do
           [ -n "$ch" ] && INSTALL_PROTOCOLS+=("$ch")
@@ -1216,12 +1218,23 @@ xray_variable() {
 
 # 快速安装变量初始化
 fast_install_variables() {
-  local _all_protocol_letters=''
-  local _idx
-  for _idx in "${!PROTOCOL_LIST[@]}"; do
-    _all_protocol_letters+="$(asc $((98 + _idx))) "
-  done
-  read -r -a INSTALL_PROTOCOLS <<< "${_all_protocol_letters% }"
+  # 默认只装 e (VLESS + WS)；若已通过 config/环境变量指定则沿用
+  if [ -z "${INSTALL_PROTOCOLS[*]}" ]; then
+    INSTALL_PROTOCOLS=(e)
+  elif [[ "${#INSTALL_PROTOCOLS[@]}" -eq 1 && "${INSTALL_PROTOCOLS[0],,}" =~ ^a$ ]]; then
+    local _all_protocol_letters=''
+    local _idx
+    for _idx in "${!PROTOCOL_LIST[@]}"; do
+      _all_protocol_letters+="$(asc $((98 + _idx))) "
+    done
+    read -r -a INSTALL_PROTOCOLS <<< "${_all_protocol_letters% }"
+  elif [[ "${#INSTALL_PROTOCOLS[@]}" -eq 1 && "${#INSTALL_PROTOCOLS[0]}" -gt 1 ]]; then
+    local _proto_str="${INSTALL_PROTOCOLS[0]}"
+    INSTALL_PROTOCOLS=()
+    while IFS= read -r -n1 _ch; do
+      [ -n "$_ch" ] && INSTALL_PROTOCOLS+=("$_ch")
+    done <<< "$_proto_str"
+  fi
 
   START_PORT=${START_PORT:-"$START_PORT_DEFAULT"}
   local _FAST_NUM=${#INSTALL_PROTOCOLS[@]}
