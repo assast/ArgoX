@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.8 (2026.07.13)'
+VERSION='2.0.9 (2026.07.13)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -30,6 +30,22 @@ CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.202
 SUBSCRIBE_TEMPLATE="https://raw.githubusercontent.com/fscarmen/client_template/main"
 DEFAULT_XRAY_VERSION='26.2.6'
 
+# WARP WireGuard 默认参数（独立账号注册；公共 key 仅作注册失败回退）
+WARP_PEER_PUBLIC_KEY='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo='
+WARP_SHARED_SECRET_KEY='YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY='
+WARP_SHARED_RESERVED='78,135,76'
+WARP_SHARED_ADDR_V4='172.16.0.2/32'
+WARP_SHARED_ADDR_V6='2606:4700:110:8a36:df92:102a:9602:fa18/128'
+WARP_MTU_DEFAULT=1200
+WARP_KEEPALIVE_DEFAULT=30
+WARP_ENDPOINT_DEFAULT='162.159.192.1:2408'
+WARP_ENDPOINT_CANDIDATES=(
+  '162.159.192.1:2408'
+  '162.159.193.1:2408'
+  '162.159.192.2:2408'
+  'engage.cloudflareclient.com:2408'
+)
+
 export DEBIAN_FRONTEND=noninteractive
 
 cleanup_temp() {
@@ -43,8 +59,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="Each selected protocol now generates 2 nodes: native exit IP + WARP exit IP"
-C[1]="每个协议同时生成 2 个节点：原生出口 IP + 套 WARP 出口 IP"
+E[1]="v2.0.9: Auto-register independent free WARP account per VPS; prefer endpoint IP; lower MTU for dual-hop stability"
+C[1]="v2.0.9: 每台 VPS 自动注册独立 free WARP 账号；endpoint 优先用 IP；降低 MTU 改善双跳稳定性"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -291,6 +307,12 @@ E[123]="Invalid input, please enter a positive integer."
 C[123]="输入无效，请输入正整数。"
 E[124]="The order of the selected protocols and ports is as follows:"
 C[124]="选择的协议及端口次序如下:"
+E[125]="Registering independent free WARP account for this VPS..."
+C[125]="正在为本机注册独立 free WARP 账号..."
+E[126]="WARP free registration failed; fell back to shared account (may be unstable)."
+C[126]="WARP 免费账号注册失败，已回退公共账号（可能不稳定）。"
+E[127]="WARP credentials ready (independent free account)."
+C[127]="WARP 凭证已就绪（独立 free 账号）。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -496,10 +518,246 @@ append_inbound_pair() {
   INBOUNDS_JSON+="$_warp_block"
 }
 
-# 根据当前 inbound.json 重写 outbound.json（WARP 链式 + inboundTag 分流）
+# ── WARP 独立账号：生成密钥 / 注册 / 持久化 / 写 outbound ──────────────────
+# 生成 WireGuard X25519 密钥对（标准 base64，非 Reality 的 URL-safe）
+warp_gen_x25519_keypair() {
+  local _pem _priv _pub
+  command -v openssl >/dev/null 2>&1 || return 1
+  _pem=$(openssl genpkey -algorithm X25519 2>/dev/null) || return 1
+  [ -z "$_pem" ] && return 1
+  _priv=$(printf '%s\n' "$_pem" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 2>/dev/null | tr -d '\n')
+  _pub=$(printf '%s\n' "$_pem" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 2>/dev/null | tr -d '\n')
+  [[ -n "$_priv" && -n "$_pub" ]] || return 1
+  WARP_GEN_PRIVATE="$_priv"
+  WARP_GEN_PUBLIC="$_pub"
+}
+
+# client_id (base64) → reserved "a,b,c"
+warp_client_id_to_reserved() {
+  local _cid="$1" _raw _b1 _b2 _b3
+  [ -n "$_cid" ] || return 1
+  _raw=$(printf '%s' "$_cid" | base64 -d 2>/dev/null | od -An -tu1 2>/dev/null | tr -s '[:space:]' ' ')
+  set -- $_raw
+  _b1=$1; _b2=$2; _b3=$3
+  [[ -n "$_b1" && -n "$_b2" && -n "$_b3" ]] || return 1
+  printf '%s,%s,%s' "$_b1" "$_b2" "$_b3"
+}
+
+# 向 Cloudflare 注册 free WARP，成功则设置 WARP_* 全局变量
+register_warp_free() {
+  local _priv _pub _body _tos _resp _api _jq _cid _v4 _v6 _rsv
+  warp_gen_x25519_keypair || return 1
+  _priv="$WARP_GEN_PRIVATE"
+  _pub="$WARP_GEN_PUBLIC"
+  _tos=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+  _body=$(printf '{"key":"%s","install_id":"","fcm_token":"","tos":"%s","model":"argox","serial_number":"","locale":"en_US"}' "$_pub" "$_tos")
+  _resp=''
+  for _api in \
+    'https://api.cloudflareclient.com/v0a2158/reg' \
+    'https://api.cloudflareclient.com/v0a1922/reg'; do
+    _resp=$(wget --no-check-certificate -qO- --timeout=15 --tries=2 \
+      --header='Content-Type: application/json' \
+      --header='CF-Client-Version: a-6.10-2158' \
+      --header='User-Agent: okhttp/3.12.1' \
+      --post-data="$_body" \
+      "$_api" 2>/dev/null) || _resp=''
+    if [ -z "$_resp" ] && command -v curl >/dev/null 2>&1; then
+      _resp=$(curl -sL --connect-timeout 10 --max-time 20 \
+        -H 'Content-Type: application/json' \
+        -H 'CF-Client-Version: a-6.10-2158' \
+        -H 'User-Agent: okhttp/3.12.1' \
+        -d "$_body" \
+        "$_api" 2>/dev/null) || _resp=''
+    fi
+    echo "$_resp" | grep -q 'client_id' && break
+    _resp=''
+  done
+  [ -n "$_resp" ] || return 1
+
+  _jq=$(_jq_bin 2>/dev/null) || true
+  if [ -n "$_jq" ] && [ -x "$_jq" ]; then
+    _cid=$("$_jq" -r '.config.client_id // empty' <<< "$_resp" 2>/dev/null)
+    _v4=$("$_jq" -r '.config.interface.addresses.v4 // empty' <<< "$_resp" 2>/dev/null)
+    _v6=$("$_jq" -r '.config.interface.addresses.v6 // empty' <<< "$_resp" 2>/dev/null)
+  else
+    _cid=$(printf '%s' "$_resp" | sed -n 's/.*"client_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    _v4=$(printf '%s' "$_resp" | sed -n 's/.*"v4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    _v6=$(printf '%s' "$_resp" | sed -n 's/.*"v6"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  fi
+  [ -n "$_cid" ] || return 1
+  _rsv=$(warp_client_id_to_reserved "$_cid") || return 1
+  _v4=${_v4:-172.16.0.2}
+  [[ "$_v4" == */* ]] || _v4="${_v4}/32"
+  if [ -n "$_v6" ]; then
+    [[ "$_v6" == */* ]] || _v6="${_v6}/128"
+  else
+    _v6="$WARP_SHARED_ADDR_V6"
+  fi
+
+  WARP_SECRET_KEY="$_priv"
+  WARP_ADDR_V4="$_v4"
+  WARP_ADDR_V6="$_v6"
+  WARP_RESERVED="$_rsv"
+  return 0
+}
+
+# 选择 WireGuard endpoint：自定义 > custom 文件 > 候选 IP 连通性探测 > 默认
+pick_warp_endpoint() {
+  local _ep _c _host _port
+  if [ -n "${WARP_ENDPOINT:-}" ]; then
+    printf '%s' "$WARP_ENDPOINT"
+    return
+  fi
+  if [ -s "$CUSTOM_FILE" ]; then
+    _ep=$(awk -F= '/^warpEndpoint=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    [ -n "$_ep" ] && { printf '%s' "$_ep"; return; }
+  fi
+  for _c in "${WARP_ENDPOINT_CANDIDATES[@]}"; do
+    _host=${_c%:*}
+    _port=${_c##*:}
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 1 bash -c "echo >/dev/tcp/${_host}/${_port}" 2>/dev/null && { printf '%s' "$_c"; return; }
+    else
+      (bash -c "echo >/dev/tcp/${_host}/${_port}") >/dev/null 2>&1 && { printf '%s' "$_c"; return; }
+    fi
+  done
+  printf '%s' "${WARP_ENDPOINT_DEFAULT}"
+}
+
+# 将 WARP 凭证写入 custom（安装/迁移后可复用）
+# 第二个参数可选：independent | shared
+save_warp_credentials() {
+  local _kind="${1:-independent}"
+  [ -n "${WARP_SECRET_KEY:-}" ] || return 1
+  mkdir -p "$WORK_DIR" 2>/dev/null || true
+  write_custom 'warpSecretKey' "${WARP_SECRET_KEY}"
+  write_custom 'warpAddrV4' "${WARP_ADDR_V4}"
+  write_custom 'warpAddrV6' "${WARP_ADDR_V6}"
+  write_custom 'warpReserved' "${WARP_RESERVED}"
+  write_custom 'warpEndpoint' "${WARP_ENDPOINT:-$(pick_warp_endpoint)}"
+  write_custom 'warpMtu' "${WARP_MTU:-$WARP_MTU_DEFAULT}"
+  write_custom 'warpAccount' "$_kind"
+}
+
+# 从 custom / 现有 outbound 加载；必要时注册独立账号；失败回退公共账号
+# 设 WARP_FORCE_REREG=1 可强制重新注册
+ensure_warp_credentials() {
+  local _jq _sk _v4 _v6 _rsv _ep _mtu _acct
+
+  # 1) 环境变量 / config.conf 已注入（非空）
+  if [ -n "${WARP_SECRET_KEY:-}" ] && [ -n "${WARP_RESERVED:-}" ]; then
+    WARP_ADDR_V4=${WARP_ADDR_V4:-$WARP_SHARED_ADDR_V4}
+    WARP_ADDR_V6=${WARP_ADDR_V6:-$WARP_SHARED_ADDR_V6}
+    WARP_ENDPOINT=${WARP_ENDPOINT:-$(pick_warp_endpoint)}
+    WARP_MTU=${WARP_MTU:-$WARP_MTU_DEFAULT}
+    return 0
+  fi
+
+  # 2) custom 持久化
+  if [ -s "$CUSTOM_FILE" ]; then
+    _sk=$(awk -F= '/^warpSecretKey=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _v4=$(awk -F= '/^warpAddrV4=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _v6=$(awk -F= '/^warpAddrV6=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _rsv=$(awk -F= '/^warpReserved=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _ep=$(awk -F= '/^warpEndpoint=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _mtu=$(awk -F= '/^warpMtu=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    _acct=$(awk -F= '/^warpAccount=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+    if [ -n "$_sk" ] && [ -n "$_rsv" ] && [ "$_sk" != "$WARP_SHARED_SECRET_KEY" ]; then
+      WARP_SECRET_KEY="$_sk"
+      WARP_ADDR_V4=${_v4:-$WARP_SHARED_ADDR_V4}
+      WARP_ADDR_V6=${_v6:-$WARP_SHARED_ADDR_V6}
+      WARP_RESERVED="$_rsv"
+      WARP_ENDPOINT=${WARP_ENDPOINT:-${_ep:-$(pick_warp_endpoint)}}
+      WARP_MTU=${WARP_MTU:-${_mtu:-$WARP_MTU_DEFAULT}}
+      return 0
+    fi
+    # 已标记 shared 且未强制重注册 → 直接用公共账号，避免每次菜单打 API
+    if [ "${WARP_FORCE_REREG:-0}" != "1" ] && [ "$_acct" = "shared" ]; then
+      WARP_SECRET_KEY="$WARP_SHARED_SECRET_KEY"
+      WARP_ADDR_V4=${_v4:-$WARP_SHARED_ADDR_V4}
+      WARP_ADDR_V6=${_v6:-$WARP_SHARED_ADDR_V6}
+      WARP_RESERVED=${_rsv:-$WARP_SHARED_RESERVED}
+      WARP_ENDPOINT=${WARP_ENDPOINT:-${_ep:-$(pick_warp_endpoint)}}
+      WARP_MTU=${WARP_MTU:-${_mtu:-$WARP_MTU_DEFAULT}}
+      return 0
+    fi
+  fi
+
+  # 3) 现有 outbound.json 中的非公共账号
+  if [ -s "$WORK_DIR/outbound.json" ]; then
+    _jq=$(_jq_bin 2>/dev/null) || true
+    if [ -n "$_jq" ] && [ -x "$_jq" ]; then
+      _sk=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+      if [ -n "$_sk" ] && [ "$_sk" != "$WARP_SHARED_SECRET_KEY" ]; then
+        _v4=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.address[0] // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+        _v6=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.address[1] // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+        _rsv=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | (.settings.reserved // []) | map(tostring) | join(",")' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+        _ep=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.peers[0].endpoint // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+        _mtu=$("$_jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.mtu // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+        if [ -n "$_rsv" ] && [ "$_rsv" != "null" ]; then
+          WARP_SECRET_KEY="$_sk"
+          WARP_ADDR_V4=${_v4:-$WARP_SHARED_ADDR_V4}
+          WARP_ADDR_V6=${_v6:-$WARP_SHARED_ADDR_V6}
+          WARP_RESERVED="$_rsv"
+          WARP_ENDPOINT=${WARP_ENDPOINT:-${_ep:-$(pick_warp_endpoint)}}
+          WARP_MTU=${WARP_MTU:-${_mtu:-$WARP_MTU_DEFAULT}}
+          save_warp_credentials independent 2>/dev/null || true
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  # 4) 注册独立 free 账号
+  if [ -n "${L:-}" ]; then
+    hint " $(text 125) "
+  else
+    hint " Registering independent free WARP account... / 正在注册独立 free WARP 账号... "
+  fi
+  if register_warp_free; then
+    WARP_ENDPOINT=${WARP_ENDPOINT:-$(pick_warp_endpoint)}
+    WARP_MTU=${WARP_MTU:-$WARP_MTU_DEFAULT}
+    save_warp_credentials independent 2>/dev/null || true
+    if [ -n "${L:-}" ]; then
+      info " $(text 127) "
+    else
+      info " WARP credentials ready (independent free account). / WARP 凭证已就绪。 "
+    fi
+    return 0
+  fi
+
+  # 5) 回退公共账号（保证安装不中断；标记 shared 避免反复打 API）
+  WARP_SECRET_KEY="$WARP_SHARED_SECRET_KEY"
+  WARP_ADDR_V4="$WARP_SHARED_ADDR_V4"
+  WARP_ADDR_V6="$WARP_SHARED_ADDR_V6"
+  WARP_RESERVED="$WARP_SHARED_RESERVED"
+  WARP_ENDPOINT=${WARP_ENDPOINT:-$(pick_warp_endpoint)}
+  WARP_MTU=${WARP_MTU:-$WARP_MTU_DEFAULT}
+  save_warp_credentials shared 2>/dev/null || true
+  if [ -n "${L:-}" ]; then
+    warning " $(text 126) "
+  else
+    warning " WARP free registration failed; fell back to shared account. / 注册失败，已回退公共账号。 "
+  fi
+  return 0
+}
+
+# 根据当前 inbound.json 重写 outbound.json（独立 WARP + inboundTag 分流）
 write_outbound_json() {
-  local _jq _out4 _out6 _rules
+  local _jq _out4 _out6 _rules _rsv1 _rsv2 _rsv3 _ep _mtu _ka
   _jq=$(_jq_bin) || return 1
+
+  ensure_warp_credentials || true
+  WARP_SECRET_KEY=${WARP_SECRET_KEY:-$WARP_SHARED_SECRET_KEY}
+  WARP_ADDR_V4=${WARP_ADDR_V4:-$WARP_SHARED_ADDR_V4}
+  WARP_ADDR_V6=${WARP_ADDR_V6:-$WARP_SHARED_ADDR_V6}
+  WARP_RESERVED=${WARP_RESERVED:-$WARP_SHARED_RESERVED}
+  _ep=${WARP_ENDPOINT:-$(pick_warp_endpoint)}
+  _mtu=${WARP_MTU:-$WARP_MTU_DEFAULT}
+  _ka=${WARP_KEEPALIVE:-$WARP_KEEPALIVE_DEFAULT}
+  IFS=',' read -r _rsv1 _rsv2 _rsv3 <<< "${WARP_RESERVED}"
+  _rsv1=${_rsv1:-78}; _rsv2=${_rsv2:-135}; _rsv3=${_rsv3:-76}
+
   _out4="${CHAT_GPT_OUT_V4:-}"
   _out6="${CHAT_GPT_OUT_V6:-}"
   # 已安装场景：若未设置，沿用现有 outbound 的 OpenAI 路由；否则默认 direct
@@ -543,28 +801,28 @@ write_outbound_json() {
             "protocol": "wireguard",
             "tag": "wireguard",
             "settings": {
-                "secretKey": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+                "secretKey": "${WARP_SECRET_KEY}",
                 "address": [
-                    "172.16.0.2/32",
-                    "2606:4700:110:8a36:df92:102a:9602:fa18/128"
+                    "${WARP_ADDR_V4}",
+                    "${WARP_ADDR_V6}"
                 ],
                 "peers": [
                     {
-                        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                        "publicKey": "${WARP_PEER_PUBLIC_KEY}",
                         "allowedIPs": [
                             "0.0.0.0/0",
                             "::/0"
                         ],
-                        "endpoint": "engage.cloudflareclient.com:2408",
-                        "keepAlive": 25
+                        "endpoint": "${_ep}",
+                        "keepAlive": ${_ka}
                     }
                 ],
                 "reserved": [
-                    78,
-                    135,
-                    76
+                    ${_rsv1},
+                    ${_rsv2},
+                    ${_rsv3}
                 ],
-                "mtu": 1280,
+                "mtu": ${_mtu},
                 "domainStrategy": "ForceIPv4",
                 "noKernelTun": true
             }
@@ -4640,6 +4898,7 @@ fi
 # 已安装环境迁移（放在 getopts 前，argox -n / 菜单均会执行）
 # 1) nginx: ^/path 会抢匹配 /path-warp → 加 $ 锚定
 # 2) outbound: WARP 改用 sockopt.dialerProxy，并加固 wireguard
+# 3) 公共 WARP 账号 / 旧 MTU / 域名 endpoint → 注册独立账号并重写 outbound
 _NEED_RESTART_XRAY=false
 _NEED_RELOAD_NGINX=false
 if [ -s "$WORK_DIR/nginx.conf" ] && grep -Eq 'location ~ \^[^[:space:]]+-(vl|vm|tr|sh|xh)(-warp)? \{' "$WORK_DIR/nginx.conf" 2>/dev/null; then
@@ -4647,6 +4906,8 @@ if [ -s "$WORK_DIR/nginx.conf" ] && grep -Eq 'location ~ \^[^[:space:]]+-(vl|vm|
   _NEED_RELOAD_NGINX=true
 fi
 if [ -s "$WORK_DIR/outbound.json" ] && [ -x "$WORK_DIR/jq" ]; then
+  _WARP_NEED_REWRITE=false
+  # 结构迁移：proxySettings → dialerProxy / 补 noKernelTun
   if ! grep -q '"dialerProxy"[[:space:]]*:[[:space:]]*"wireguard"' "$WORK_DIR/outbound.json" 2>/dev/null \
      || ! grep -q '"noKernelTun"' "$WORK_DIR/outbound.json" 2>/dev/null; then
     _OUT_TMP=$(mktemp 2>/dev/null || echo "$TEMP_DIR/outbound.fix")
@@ -4655,8 +4916,8 @@ if [ -s "$WORK_DIR/outbound.json" ] && [ -x "$WORK_DIR/jq" ]; then
         if .tag == "wireguard" and .protocol == "wireguard" then
           .settings.domainStrategy = (.settings.domainStrategy // "ForceIPv4")
           | .settings.noKernelTun = true
-          | .settings.mtu = (.settings.mtu // 1280)
-          | .settings.peers |= map(.keepAlive = (.keepAlive // 25))
+          | .settings.mtu = (.settings.mtu // 1200)
+          | .settings.peers |= map(.keepAlive = (.keepAlive // 30))
         elif (.tag == "warp-IPv4" or .tag == "warp-IPv6") then
           del(.proxySettings)
           | .streamSettings.sockopt.dialerProxy = "wireguard"
@@ -4670,6 +4931,48 @@ if [ -s "$WORK_DIR/outbound.json" ] && [ -x "$WORK_DIR/jq" ]; then
     fi
     unset _OUT_TMP
   fi
+  # 凭证迁移：公共 key → 独立账号；域名 endpoint / 偏大 MTU → 参数优化
+  # 注意：注册失败时不要每次启动都 rewrite+restart
+  _CUR_SK=$("$WORK_DIR/jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.secretKey // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+  _CUR_EP=$("$WORK_DIR/jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.peers[0].endpoint // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+  _CUR_MTU=$("$WORK_DIR/jq" -r '.outbounds[]? | select(.tag=="wireguard") | .settings.mtu // empty' "$WORK_DIR/outbound.json" 2>/dev/null | head -1)
+  _HAS_CUSTOM_WARP=false
+  [ -s "$CUSTOM_FILE" ] && grep -q "^warpSecretKey=" "$CUSTOM_FILE" 2>/dev/null \
+    && ! grep -q "^warpSecretKey=${WARP_SHARED_SECRET_KEY}$" "$CUSTOM_FILE" 2>/dev/null \
+    && _HAS_CUSTOM_WARP=true
+
+  if [ -z "${L:-}" ] && [ -s "$CUSTOM_FILE" ]; then
+    case "$(awk -F= '/^language=/{print tolower($2)}' "$CUSTOM_FILE" 2>/dev/null)" in
+      c|chinese ) L=C ;;
+      * ) L=E ;;
+    esac
+  fi
+  L=${L:-E}
+
+  # 公共账号 / 空账号：尝试升级为独立账号；仅在拿到非公共 key 或 custom 已有独立 key 时重写
+  if [ -z "$_CUR_SK" ] || [ "$_CUR_SK" = "$WARP_SHARED_SECRET_KEY" ]; then
+    if $_HAS_CUSTOM_WARP; then
+      _WARP_NEED_REWRITE=true
+    else
+      ensure_warp_credentials || true
+      if [ -n "${WARP_SECRET_KEY:-}" ] && [ "$WARP_SECRET_KEY" != "$WARP_SHARED_SECRET_KEY" ]; then
+        _WARP_NEED_REWRITE=true
+      fi
+    fi
+  fi
+  # 参数优化：仅当 outbound 仍是域名 endpoint 或 MTU 偏大时重写一次
+  if [ -n "$_CUR_EP" ] && [[ "$_CUR_EP" == *engage.cloudflareclient.com* ]]; then
+    _WARP_NEED_REWRITE=true
+  fi
+  if [ -n "$_CUR_MTU" ] && [ "$_CUR_MTU" -gt 1200 ] 2>/dev/null; then
+    _WARP_NEED_REWRITE=true
+  fi
+  if $_WARP_NEED_REWRITE && [ -s "$WORK_DIR/inbound.json" ]; then
+    if write_outbound_json; then
+      _NEED_RESTART_XRAY=true
+    fi
+  fi
+  unset _WARP_NEED_REWRITE _CUR_SK _CUR_EP _CUR_MTU _HAS_CUSTOM_WARP
 fi
 if $_NEED_RELOAD_NGINX; then
   if command -v nginx >/dev/null 2>&1 && [ -s "$WORK_DIR/nginx.conf" ]; then

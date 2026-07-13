@@ -21,6 +21,8 @@
 * * *
 
 ## Update Information
+2026.07.13 v2.0.9 Auto-register an independent free WARP account per VPS; prefer IP endpoints; default MTU 1200 for CDN+WARP dual-hop stability; migrate installed shared accounts automatically
+
 2026.07.13 v2.0.8 Each selected protocol now generates 2 nodes: native exit IP + WARP exit IP (server-side inboundTag routing)
 
 2026.06.04 v2.0.7 1. Replace Nekobox with Throne for client output; 2. Independent v2rayN configuration output; 3. Security upgrade: remove insecure=true, use TLS certificate fingerprint verification

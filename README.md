@@ -20,6 +20,8 @@
 
 * * *
 ## 更新信息
+2026.07.13 v2.0.9 每台 VPS 自动注册独立 free WARP 账号；endpoint 优先使用 IP；MTU 默认 1200 改善 CDN+WARP 双跳稳定性；已安装环境自动从公共账号迁移
+
 2026.07.13 v2.0.8 每个协议同时生成 2 个节点：原生出口 IP + 套 WARP 出口 IP（服务端 inboundTag 分流）
 
 2026.06.04 v2.0.7 1. 使用 Throne 替代 Nekobox 进行客户端输出; 2. 独立生成 v2rayN 配置; 3. 安全升级：移除 insecure=true，启用 TLS 证书指纹校验
