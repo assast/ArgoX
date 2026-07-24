@@ -20,6 +20,8 @@
 
 * * *
 ## 更新信息
+2026.07.24 v2.0.13 1. Argo/Xray systemd 改为 `Restart=always` 并取消启动限速，崩溃后自动拉起；2. 查看节点信息时自动启动未运行服务，无需再按 y；3. 启动失败时回退显示缓存节点信息；4. 已安装环境自动迁移 unit 配置
+
 2026.07.14 v2.0.12 尽量换到不同 WARP 出口 IP：扩大 Endpoint 候选池、`argox -p` 支持随机换端点、`argox -w` 多轮「重注册+轮换 Endpoint」并探测出口 IP（`WARP_REREG_TRIES` 可调，默认 3）
 
 2026.07.14 v2.0.11 WARP 操作拆分：`argox -p` 更换 Endpoint（轻）；`argox -w` 重新注册账号（重）

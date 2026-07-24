@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.12 (2026.07.14)'
+VERSION='2.0.13 (2026.07.24)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -77,8 +77,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="v2.0.12: Prefer different WARP exit IPs via endpoint rotation + multi-try re-register"
-C[1]="v2.0.12: 通过轮换 Endpoint + 多轮重注册尽量拿到不同 WARP 出口 IP"
+E[1]="v2.0.13: Auto-restart Argo/Xray on crash, auto-start when viewing nodes, fall back to cached list"
+C[1]="v2.0.13: Argo/Xray 崩溃自动拉起；查看节点自动启动服务；失败时回退显示缓存节点信息"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -175,8 +175,8 @@ E[48]="Downloading the latest version \${APP} failed, script exits. Feedback:[ht
 C[48]="下载最新版本 \${APP} 失败，脚本退出，问题反馈:[https://github.com/fscarmen/argox/issues]"
 E[49]="\${TOTAL_STEPS:+(\${STEP_NUM}/\${TOTAL_STEPS}) }Please enter the node name. (Default is \${NODE_NAME_DEFAULT}):"
 C[49]="\${TOTAL_STEPS:+(\${STEP_NUM}/\${TOTAL_STEPS}) }请输入节点名称 (默认为 \${NODE_NAME_DEFAULT}):"
-E[50]="\${APP[*]} services are not enabled, node information cannot be output. Press [y] if you want to open."
-C[50]="\${APP[*]} 服务未开启，不能输出节点信息。如需打开请按 [y]: "
+E[50]="\${APP[*]} services are not running. Auto-starting..."
+C[50]="\${APP[*]} 服务未开启，正在自动启动..."
 E[51]="Install Sing-box multi-protocol scripts [https://github.com/fscarmen/sing-box]"
 C[51]="安装 Sing-box 协议全家桶脚本 [https://github.com/fscarmen/sing-box]"
 E[52]="Memory Usage"
@@ -367,6 +367,10 @@ E[144]="Could not probe WARP exit IP (account/endpoint still applied)."
 C[144]="无法探测 WARP 出口 IP（账号/Endpoint 仍已生效）。"
 E[145]="This will re-register free WARP, rotate endpoint, and retry up to \${_tries} time(s) for a different exit IP. Continue? [y/N]:"
 C[145]="将重新注册 free WARP、轮换 Endpoint，最多尝试 \${_tries} 轮以尽量换出口 IP。继续？ [y/N]:"
+E[146]="\${APP[*]} still not running after auto-start. Showing last cached node list (may be outdated):"
+C[146]="\${APP[*]} 自动启动后仍未运行，改显示上次缓存的节点信息（可能过期）:"
+E[147]="\${APP[*]} still not running after auto-start, and no cached node list found."
+C[147]="\${APP[*]} 自动启动后仍未运行，且没有可用的缓存节点信息。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -1336,16 +1340,33 @@ check_arch() {
   esac
 }
 
+# 进程兜底判断服务是否在跑（systemctl 短暂 inactive / failed 时仍可能已有进程）
+is_process_running() {
+  case "$1" in
+    argo) pgrep -f "$WORK_DIR/cloudflared" >/dev/null 2>&1 ;;
+    xray) pgrep -f "$WORK_DIR/xray" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 # 查安装及运行状态，下标0: argo，下标1: xray，下标2: nginx；状态码: 26 未安装， 27 已安装未运行， 28 运行中
 check_install() {
   [ -s $WORK_DIR/nginx.conf ] && IS_NGINX=is_nginx || IS_NGINX=no_nginx
   STATUS[0]=$(text 26)
 
-  [ -s ${ARGO_DAEMON_FILE} ] && STATUS[0]=$(text 27) && cmd_systemctl status argo &>/dev/null && STATUS[0]=$(text 28)
+  if [ -s ${ARGO_DAEMON_FILE} ]; then
+    STATUS[0]=$(text 27)
+    if cmd_systemctl status argo &>/dev/null || is_process_running argo; then
+      STATUS[0]=$(text 28)
+    fi
+  fi
   STATUS[1]=$(text 26)
   if [ -s ${XRAY_DAEMON_FILE} ]; then
     ! grep -q "$WORK_DIR" ${XRAY_DAEMON_FILE} && error " $(text 53)\n $(grep "${DAEMON_RUN_PATTERN}" ${XRAY_DAEMON_FILE}) "
-    STATUS[1]=$(text 27) && cmd_systemctl status xray &>/dev/null && STATUS[1]=$(text 28)
+    STATUS[1]=$(text 27)
+    if cmd_systemctl status xray &>/dev/null || is_process_running xray; then
+      STATUS[1]=$(text 28)
+    fi
   fi
   STATUS[2]=$(text 26)
   if [ "$IS_NGINX" = 'is_nginx' ]; then
@@ -1387,10 +1408,12 @@ cmd_systemctl() {
       rc-update add $APP default >/dev/null 2>&1
     elif [ "$IS_CENTOS" = 'CentOS7' ]; then
       systemctl daemon-reload
+      systemctl reset-failed $APP >/dev/null 2>&1 || true
       systemctl enable --now $APP >/dev/null 2>&1
       [[ "$APP" = 'xray' && "$IS_NGINX" = 'is_nginx' ]] && [ -s $WORK_DIR/nginx.conf ] && nginx_run
     else
       systemctl daemon-reload
+      systemctl reset-failed $APP >/dev/null 2>&1 || true
       systemctl enable --now $APP >/dev/null 2>&1
     fi
 
@@ -1409,10 +1432,12 @@ cmd_systemctl() {
       rc-service $APP restart >/dev/null 2>&1
     elif [ "$IS_CENTOS" = 'CentOS7' ]; then
       systemctl daemon-reload
+      systemctl reset-failed $APP >/dev/null 2>&1 || true
       systemctl restart $APP >/dev/null 2>&1
       [[ "$APP" = 'xray' && "$IS_NGINX" = 'is_nginx' ]] && [ -s $WORK_DIR/nginx.conf ] && nginx_run
     else
       systemctl daemon-reload
+      systemctl reset-failed $APP >/dev/null 2>&1 || true
       systemctl restart $APP >/dev/null 2>&1
     fi
   elif [ "$ENABLE_DISABLE" = 'status' ]; then
@@ -3385,16 +3410,17 @@ EOF
   else
     local ARGO_SERVER="[Unit]
 Description=Cloudflare Tunnel
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 NoNewPrivileges=yes
-TimeoutStartSec=0"
-    ARGO_SERVER+="
+TimeoutStartSec=0
 ExecStart=$ARGO_RUNS
-Restart=on-failure
+Restart=always
 RestartSec=5s
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target"
@@ -3404,7 +3430,8 @@ WantedBy=multi-user.target"
     local XRAY_SERVICE="[Unit]
 Description=Xray Service
 Documentation=https://github.com/XTLS/Xray-core
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=root"
@@ -3412,8 +3439,10 @@ User=root"
 ExecStartPre=/bin/bash -c 'nginx -c $WORK_DIR/nginx.conf -s reload 2>/dev/null || nginx -c $WORK_DIR/nginx.conf'"
     XRAY_SERVICE+="
 ExecStart=$WORK_DIR/xray run -c $WORK_DIR/inbound.json -c $WORK_DIR/outbound.json
-Restart=on-failure
+Restart=always
+RestartSec=5s
 RestartPreventExitStatus=23
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target"
@@ -3964,19 +3993,26 @@ export_list() {
   [ "${STATUS[0]}" != "$(text 28)" ] && APP+=(Argo)
   [ "${STATUS[1]}" != "$(text 28)" ] && APP+=(Xray)
   if [ "${#APP[@]}" -gt 0 ]; then
-    reading "\n $(text 50) " OPEN_APP
-    if [ "${OPEN_APP,,}" = 'y' ]; then
-      [ "${STATUS[0]}" != "$(text 28)" ] && cmd_systemctl enable argo
-      [ "${STATUS[1]}" != "$(text 28)" ] && cmd_systemctl enable xray
-      sleep 2
-      check_install
-      ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
-      [ -n "$ARGO_PID" ] && ARGO_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status) MB"
-      XRAY_PID=$(pgrep -f "$WORK_DIR/xray")
-      [ -n "$XRAY_PID" ] && XRAY_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${XRAY_PID%% *}/status) MB"
-    else
-      exit
+    hint "\n $(text 50) "
+    [ "${STATUS[0]}" != "$(text 28)" ] && cmd_systemctl enable argo
+    [ "${STATUS[1]}" != "$(text 28)" ] && cmd_systemctl enable xray
+    sleep 2
+    check_install
+    APP=()
+    [ "${STATUS[0]}" != "$(text 28)" ] && APP+=(Argo)
+    [ "${STATUS[1]}" != "$(text 28)" ] && APP+=(Xray)
+    if [ "${#APP[@]}" -gt 0 ]; then
+      if [ -s "$WORK_DIR/list" ]; then
+        warning "\n $(text 146) "
+        cat "$WORK_DIR/list"
+        return 0
+      fi
+      error "\n $(text 147) "
     fi
+    ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
+    [ -n "$ARGO_PID" ] && ARGO_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status 2>/dev/null) MB"
+    XRAY_PID=$(pgrep -f "$WORK_DIR/xray")
+    [ -n "$XRAY_PID" ] && XRAY_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${XRAY_PID%% *}/status 2>/dev/null) MB"
   fi
 
   # Token 模式不会写 tunnel.yml，优先从 custom 恢复安装时保存的域名，再尝试 metrics / 已有 list
@@ -5333,8 +5369,77 @@ fi
 # 1) nginx: ^/path 会抢匹配 /path-warp → 加 $ 锚定
 # 2) outbound: WARP 改用 sockopt.dialerProxy，并加固 wireguard
 # 3) 公共 WARP 账号 / 旧 MTU / 域名 endpoint → 注册独立账号并重写 outbound
+# 4) systemd unit: Restart=always + StartLimitIntervalSec=0，避免偶发崩溃后不拉起
 _NEED_RESTART_XRAY=false
+_NEED_RESTART_ARGO=false
 _NEED_RELOAD_NGINX=false
+_NEED_DAEMON_RELOAD=false
+if [ -s /etc/systemd/system/argo.service ]; then
+  _UNIT_CHANGED=false
+  if grep -qE '^Restart=on-failure' /etc/systemd/system/argo.service 2>/dev/null; then
+    sed -i 's/^Restart=on-failure/Restart=always/' /etc/systemd/system/argo.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^StartLimitIntervalSec=' /etc/systemd/system/argo.service 2>/dev/null; then
+    if grep -qE '^RestartSec=' /etc/systemd/system/argo.service 2>/dev/null; then
+      sed -i '/^RestartSec=/a StartLimitIntervalSec=0' /etc/systemd/system/argo.service
+    else
+      sed -i '/^Restart=/a StartLimitIntervalSec=0' /etc/systemd/system/argo.service
+    fi
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^RestartSec=' /etc/systemd/system/argo.service 2>/dev/null; then
+    sed -i '/^Restart=/a RestartSec=5s' /etc/systemd/system/argo.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^After=network-online\.target' /etc/systemd/system/argo.service 2>/dev/null; then
+    sed -i 's/^After=network\.target/After=network-online.target/' /etc/systemd/system/argo.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^Wants=network-online\.target' /etc/systemd/system/argo.service 2>/dev/null; then
+    sed -i '/^After=network-online\.target/a Wants=network-online.target' /etc/systemd/system/argo.service
+    _UNIT_CHANGED=true
+  fi
+  if $_UNIT_CHANGED; then
+    _NEED_DAEMON_RELOAD=true
+    _NEED_RESTART_ARGO=true
+  fi
+  unset _UNIT_CHANGED
+fi
+if [ -s /etc/systemd/system/xray.service ]; then
+  _UNIT_CHANGED=false
+  if grep -qE '^Restart=on-failure' /etc/systemd/system/xray.service 2>/dev/null; then
+    sed -i 's/^Restart=on-failure/Restart=always/' /etc/systemd/system/xray.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^StartLimitIntervalSec=' /etc/systemd/system/xray.service 2>/dev/null; then
+    if grep -qE '^RestartSec=' /etc/systemd/system/xray.service 2>/dev/null; then
+      sed -i '/^RestartSec=/a StartLimitIntervalSec=0' /etc/systemd/system/xray.service
+    elif grep -qE '^RestartPreventExitStatus=' /etc/systemd/system/xray.service 2>/dev/null; then
+      sed -i '/^RestartPreventExitStatus=/a StartLimitIntervalSec=0' /etc/systemd/system/xray.service
+    else
+      sed -i '/^Restart=/a StartLimitIntervalSec=0' /etc/systemd/system/xray.service
+    fi
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^RestartSec=' /etc/systemd/system/xray.service 2>/dev/null; then
+    sed -i '/^Restart=/a RestartSec=5s' /etc/systemd/system/xray.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^After=network-online\.target' /etc/systemd/system/xray.service 2>/dev/null; then
+    sed -i 's/^After=network\.target/After=network-online.target/' /etc/systemd/system/xray.service
+    _UNIT_CHANGED=true
+  fi
+  if ! grep -qE '^Wants=network-online\.target' /etc/systemd/system/xray.service 2>/dev/null; then
+    sed -i '/^After=network-online\.target/a Wants=network-online.target' /etc/systemd/system/xray.service
+    _UNIT_CHANGED=true
+  fi
+  if $_UNIT_CHANGED; then
+    _NEED_DAEMON_RELOAD=true
+    _NEED_RESTART_XRAY=true
+  fi
+  unset _UNIT_CHANGED
+fi
 if [ -s "$WORK_DIR/nginx.conf" ] && grep -Eq 'location ~ \^[^[:space:]]+-(vl|vm|tr|sh|xh)(-warp)? \{' "$WORK_DIR/nginx.conf" 2>/dev/null; then
   sed -i -E 's|(location ~ \^[^[:space:]]+-(vl|vm|tr|sh|xh)(-warp)?) \{|\1$ {|g' "$WORK_DIR/nginx.conf"
   _NEED_RELOAD_NGINX=true
@@ -5414,14 +5519,30 @@ if $_NEED_RELOAD_NGINX; then
       || { pgrep -f "nginx: master process" >/dev/null 2>&1 && kill -HUP "$(pgrep -f 'nginx: master process' | head -1)" >/dev/null 2>&1 || true; }
   fi
 fi
+if $_NEED_DAEMON_RELOAD && command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if $_NEED_RESTART_ARGO; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reset-failed argo >/dev/null 2>&1 || true
+    if systemctl is-enabled --quiet argo 2>/dev/null || systemctl is-active --quiet argo 2>/dev/null || pgrep -f "$WORK_DIR/cloudflared" >/dev/null 2>&1; then
+      systemctl restart argo >/dev/null 2>&1 || systemctl start argo >/dev/null 2>&1 || true
+    fi
+  elif [ -x /etc/init.d/argo ]; then
+    /etc/init.d/argo restart >/dev/null 2>&1 || true
+  fi
+fi
 if $_NEED_RESTART_XRAY; then
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet xray 2>/dev/null; then
-    systemctl restart xray >/dev/null 2>&1 || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reset-failed xray >/dev/null 2>&1 || true
+    if systemctl is-enabled --quiet xray 2>/dev/null || systemctl is-active --quiet xray 2>/dev/null || pgrep -f "$WORK_DIR/xray" >/dev/null 2>&1; then
+      systemctl restart xray >/dev/null 2>&1 || systemctl start xray >/dev/null 2>&1 || true
+    fi
   elif [ -x /etc/init.d/xray ]; then
     /etc/init.d/xray restart >/dev/null 2>&1 || true
   fi
 fi
-unset _NEED_RESTART_XRAY _NEED_RELOAD_NGINX
+unset _NEED_RESTART_XRAY _NEED_RESTART_ARGO _NEED_RELOAD_NGINX _NEED_DAEMON_RELOAD
 
 # 传参
 [[ "${*,,}" =~ '-e'|'-k' ]] && L=E

@@ -21,6 +21,8 @@
 * * *
 
 ## Update Information
+2026.07.24 v2.0.13 1. Argo/Xray systemd units use `Restart=always` without start-rate limit so crashed services come back; 2. Viewing node info auto-starts stopped services (no more press y); 3. Fall back to cached node list if auto-start fails; 4. Existing installs migrate unit config automatically
+
 2026.07.14 v2.0.12 Prefer different WARP exit IPs: larger endpoint pool, `argox -p` random endpoint option, `argox -w` multi-try re-register + endpoint rotate with exit-IP probe (`WARP_REREG_TRIES`, default 3)
 
 2026.07.14 v2.0.11 Split WARP actions: `argox -p` change endpoint (light); `argox -w` re-register account (heavy)
