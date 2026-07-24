@@ -21,6 +21,8 @@
 * * *
 
 ## Update Information
+2026.07.24 v2.0.14 1. Multi-try auto-start of Argo/Xray when viewing nodes, with failure diagnostics; 2. Still export node info from local config if services stay down; 3. Ensure Nginx is up before starting Try tunnels
+
 2026.07.24 v2.0.13 1. Argo/Xray systemd units use `Restart=always` without start-rate limit so crashed services come back; 2. Viewing node info auto-starts stopped services (no more press y); 3. Fall back to cached node list if auto-start fails; 4. Existing installs migrate unit config automatically
 
 2026.07.14 v2.0.12 Prefer different WARP exit IPs: larger endpoint pool, `argox -p` random endpoint option, `argox -w` multi-try re-register + endpoint rotate with exit-IP probe (`WARP_REREG_TRIES`, default 3)

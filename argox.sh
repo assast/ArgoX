@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.0.13 (2026.07.24)'
+VERSION='2.0.14 (2026.07.24)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -77,8 +77,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="v2.0.13: Auto-restart Argo/Xray on crash, auto-start when viewing nodes, fall back to cached list"
-C[1]="v2.0.13: Argo/Xray 崩溃自动拉起；查看节点自动启动服务；失败时回退显示缓存节点信息"
+E[1]="v2.0.14: Harder Argo/Xray auto-start with diagnostics; always export node info from config even if Argo is down"
+C[1]="v2.0.14: 加强 Argo/Xray 自动拉起与失败诊断；服务未启动时仍从配置输出节点信息"
 E[2]="Project to create Argo tunnels and Xray specifically for VPS, detailed:[https://github.com/fscarmen/argox]\n Features:\n\t • Allows the creation of Argo tunnels via Token, Json and ad hoc methods. User can easily obtain the json at https://fscarmen.cloudflare.now.cc .\n\t • Extremely fast installation method, saving users time.\n\t • Support system: Ubuntu, Debian, CentOS, Alpine and Arch Linux 3.\n\t • Support architecture: AMD,ARM and s390x\n"
 C[2]="本项目专为 VPS 添加 Argo 隧道及 Xray,详细说明: [https://github.com/fscarmen/argox]\n 脚本特点:\n\t • 允许通过 Token, Json 及 临时方式来创建 Argo 隧道,用户通过以下网站轻松获取 json: https://fscarmen.cloudflare.now.cc\n\t • 极速安装方式,大大节省用户时间\n\t • 智能判断操作系统: Ubuntu 、Debian 、CentOS 、Alpine 和 Arch Linux,请务必选择 LTS 系统\n\t • 支持硬件结构类型: AMD 和 ARM\n"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -371,6 +371,12 @@ E[146]="\${APP[*]} still not running after auto-start. Showing last cached node 
 C[146]="\${APP[*]} 自动启动后仍未运行，改显示上次缓存的节点信息（可能过期）:"
 E[147]="\${APP[*]} still not running after auto-start, and no cached node list found."
 C[147]="\${APP[*]} 自动启动后仍未运行，且没有可用的缓存节点信息。"
+E[148]="\${APP[*]} still not running after auto-start. Continue exporting nodes from local config; CDN/Argo links may be offline."
+C[148]="\${APP[*]} 自动启动后仍未运行。继续根据本地配置输出节点；走 CDN/Argo 的链路可能暂时不可用。"
+E[149]="Service diagnostics (\${_app}):"
+C[149]="服务诊断信息 (\${_app}):"
+E[150]="Hint: check binary, unit ExecStart, tunnel token/json, and whether Nginx is listening for Try tunnel."
+C[150]="提示：请检查二进制、unit 的 ExecStart、隧道 Token/Json，以及 Try 隧道所需的 Nginx 是否在监听。"
 
 # 自定义字体彩色，read 函数
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; }         # 红色
@@ -1347,6 +1353,85 @@ is_process_running() {
     xray) pgrep -f "$WORK_DIR/xray" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
+}
+
+# 多轮拉起服务：处理 failed 状态、Try 隧道依赖 Nginx、短暂启动延迟
+ensure_service_running() {
+  local _app="$1"
+  local _tries="${2:-3}"
+  local _i _bin
+
+  for ((_i=1; _i<=_tries; _i++)); do
+    if cmd_systemctl status "$_app" &>/dev/null || is_process_running "$_app"; then
+      return 0
+    fi
+
+    if [ "$_app" = 'argo' ]; then
+      _bin="$WORK_DIR/cloudflared"
+      [ ! -x "$_bin" ] && return 1
+      # Try 隧道回源到本机 Nginx，先确保 Nginx 在跑
+      if [ -s "$WORK_DIR/nginx.conf" ] && ! pgrep -f "nginx: master process" >/dev/null 2>&1; then
+        $(command -v nginx) -c "$WORK_DIR/nginx.conf" >/dev/null 2>&1 || true
+      fi
+      # Json 隧道依赖 tunnel.yml / tunnel.json
+      if grep -qs "${DAEMON_RUN_PATTERN}.*--config" "${ARGO_DAEMON_FILE}" 2>/dev/null; then
+        [ ! -s "$WORK_DIR/tunnel.yml" ] && [ -s "$WORK_DIR/tunnel.json" ] && json_argo
+        [ ! -s "$WORK_DIR/tunnel.yml" ] && return 1
+      fi
+    elif [ "$_app" = 'xray' ]; then
+      _bin="$WORK_DIR/xray"
+      [ ! -x "$_bin" ] && return 1
+      [ ! -s "$WORK_DIR/inbound.json" ] && return 1
+    fi
+
+    if [ "$_i" -eq 1 ]; then
+      cmd_systemctl enable "$_app"
+    else
+      cmd_systemctl restart "$_app"
+    fi
+    sleep $((_i + 1))
+  done
+
+  cmd_systemctl status "$_app" &>/dev/null || is_process_running "$_app"
+}
+
+# 输出服务启动失败诊断，便于定位 cloudflared/xray 起不来的原因
+show_service_diag() {
+  local _app="$1"
+  local _unit_file _log_file _lines
+  warning "\n $(text 149) "
+  hint " $(text 150) "
+
+  if [ "$_app" = 'argo' ]; then
+    _unit_file="${ARGO_DAEMON_FILE}"
+    _log_file="$WORK_DIR/argo.log"
+    if [ -x "$WORK_DIR/cloudflared" ]; then
+      hint " cloudflared: $($WORK_DIR/cloudflared -v 2>/dev/null | head -1)"
+    else
+      warning " cloudflared binary missing/not executable: $WORK_DIR/cloudflared"
+    fi
+  else
+    _unit_file="${XRAY_DAEMON_FILE}"
+    _log_file="$WORK_DIR/xray.log"
+    if [ -x "$WORK_DIR/xray" ]; then
+      hint " xray: $($WORK_DIR/xray version 2>/dev/null | head -1)"
+    else
+      warning " xray binary missing/not executable: $WORK_DIR/xray"
+    fi
+  fi
+
+  if [ -s "$_unit_file" ]; then
+    hint " unit: $_unit_file"
+    grep -E "^(ExecStart|command=|command_args=|Restart=)" "$_unit_file" 2>/dev/null | sed 's/^/  /'
+  fi
+
+  if [ "$SYSTEM" != 'Alpine' ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$_app" --no-pager -l 2>/dev/null | sed -n '1,20p' | sed 's/^/  /'
+    _lines=$(journalctl -u "$_app" -n 20 --no-pager 2>/dev/null)
+    [ -n "$_lines" ] && printf '%s\n' "$_lines" | sed 's/^/  /'
+  elif [ -s "$_log_file" ]; then
+    tail -n 20 "$_log_file" 2>/dev/null | sed 's/^/  /'
+  fi
 }
 
 # 查安装及运行状态，下标0: argo，下标1: xray，下标2: nginx；状态码: 26 未安装， 27 已安装未运行， 28 运行中
@@ -3994,20 +4079,17 @@ export_list() {
   [ "${STATUS[1]}" != "$(text 28)" ] && APP+=(Xray)
   if [ "${#APP[@]}" -gt 0 ]; then
     hint "\n $(text 50) "
-    [ "${STATUS[0]}" != "$(text 28)" ] && cmd_systemctl enable argo
-    [ "${STATUS[1]}" != "$(text 28)" ] && cmd_systemctl enable xray
-    sleep 2
+    [ "${STATUS[0]}" != "$(text 28)" ] && ensure_service_running argo 3 || true
+    [ "${STATUS[1]}" != "$(text 28)" ] && ensure_service_running xray 3 || true
     check_install
     APP=()
     [ "${STATUS[0]}" != "$(text 28)" ] && APP+=(Argo)
     [ "${STATUS[1]}" != "$(text 28)" ] && APP+=(Xray)
     if [ "${#APP[@]}" -gt 0 ]; then
-      if [ -s "$WORK_DIR/list" ]; then
-        warning "\n $(text 146) "
-        cat "$WORK_DIR/list"
-        return 0
-      fi
-      error "\n $(text 147) "
+      # 服务起不来时仍继续从本地配置输出节点；仅在配置缺失时才回退缓存
+      warning "\n $(text 148) "
+      [[ " ${APP[*]} " == *" Argo "* ]] && show_service_diag argo
+      [[ " ${APP[*]} " == *" Xray "* ]] && show_service_diag xray
     fi
     ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
     [ -n "$ARGO_PID" ] && ARGO_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status 2>/dev/null) MB"
@@ -4017,16 +4099,31 @@ export_list() {
 
   # Token 模式不会写 tunnel.yml，优先从 custom 恢复安装时保存的域名，再尝试 metrics / 已有 list
   [ -z "$ARGO_DOMAIN" ] && [ -s "$CUSTOM_FILE" ] && ARGO_DOMAIN=$(awk -F= '/^argoDomain=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
-  if grep -qs "^${DAEMON_RUN_PATTERN}.*--url" ${ARGO_DAEMON_FILE}; then
-    fetch_tunnel_domain quick || true
-  else
-    fetch_tunnel_domain config >/dev/null 2>&1 || true
-    [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ] && ARGO_DOMAIN=$(awk '/^[[:space:]]*-[[:space:]]*hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml" 2>/dev/null)
-    [ -z "$ARGO_DOMAIN" ] && [ -s "$CUSTOM_FILE" ] && ARGO_DOMAIN=$(awk -F= '/^argoDomain=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
-    [ -z "$ARGO_DOMAIN" ] && ARGO_DOMAIN=$(grep -m1 '^vless.*host=.*' $WORK_DIR/list 2>/dev/null | sed "s@.*host=\(.*\)&.*@\1@g")
+  if [ -s "${ARGO_DAEMON_FILE}" ]; then
+    if grep -qs "^${DAEMON_RUN_PATTERN}.*--url" ${ARGO_DAEMON_FILE}; then
+      # Try 隧道只有 cloudflared 在跑时域名才可靠；失败则保留 custom/list 缓存域名
+      if is_process_running argo || cmd_systemctl status argo &>/dev/null; then
+        fetch_tunnel_domain quick || true
+      fi
+    else
+      if is_process_running argo || cmd_systemctl status argo &>/dev/null; then
+        fetch_tunnel_domain config >/dev/null 2>&1 || true
+      fi
+      [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ] && ARGO_DOMAIN=$(awk '/^[[:space:]]*-[[:space:]]*hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml" 2>/dev/null)
+    fi
   fi
+  [ -z "$ARGO_DOMAIN" ] && [ -s "$CUSTOM_FILE" ] && ARGO_DOMAIN=$(awk -F= '/^argoDomain=/{print $2; exit}' "$CUSTOM_FILE" 2>/dev/null)
+  [ -z "$ARGO_DOMAIN" ] && ARGO_DOMAIN=$(grep -m1 '^vless.*host=.*' $WORK_DIR/list 2>/dev/null | sed "s@.*host=\(.*\)&.*@\1@g")
   [ -n "$ARGO_DOMAIN" ] && write_custom 'argoDomain' "$ARGO_DOMAIN"
-  fetch_nodes_value
+
+  if ! fetch_nodes_value; then
+    if [ -s "$WORK_DIR/list" ]; then
+      warning "\n $(text 146) "
+      cat "$WORK_DIR/list"
+      return 0
+    fi
+    error "\n $(text 147) "
+  fi
 
   local _SUB_SCHEME='https'
 
